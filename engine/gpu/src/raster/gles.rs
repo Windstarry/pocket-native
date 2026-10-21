@@ -1904,21 +1904,33 @@ impl Egl {
             let gles = open(gles_names).ok();
             let loaded = egl::Egl::load_with(|name| symbol(&library, name));
             let (mut major, mut minor) = (0, 0);
-            let mut display = loaded.GetDisplay(kms.device as glutin_egl_sys::EGLNativeDisplayType);
-            let mut ready = !display.is_null() && loaded.Initialize(display, &mut major, &mut minor) != 0;
-            if !ready {
-                // the Mali blob's legacy eglGetDisplay returns no display for
-                // a GBM device (g29p1 on the RG52 Mini); the platform call works
-                const EGL_PLATFORM_GBM_KHR: u32 = 0x31D7;
-                let platform = ["eglGetPlatformDisplay", "eglGetPlatformDisplayEXT"]
-                    .iter()
-                    .map(|name| symbol(&library, name))
-                    .find(|address| !address.is_null());
-                if let Some(address) = platform {
+            // A GBM device is a platform display, so ask for it through the
+            // platform entry point first. Plain eglGetDisplay is not safe to
+            // even try on some stacks: ROCKNIX routes libEGL and libgbm
+            // through libmali-hook, which hands a raw GBM device handle to
+            // the Mali DDK, whose default platform is X11; with no X server
+            // that segfaults (g29p1 on ROCKNIX RK356X, exit status 139 in
+            // XNoOp) before any fallback below could run.
+            const EGL_PLATFORM_GBM_KHR: u32 = 0x31D7;
+            let platform = ["eglGetPlatformDisplay", "eglGetPlatformDisplayEXT"]
+                .iter()
+                .map(|name| symbol(&library, name))
+                .find(|address| !address.is_null());
+            let mut display = match platform {
+                Some(address) => {
                     let get: extern "C" fn(u32, *mut c_void, *const i32) -> egl::types::EGLDisplay = std::mem::transmute(address);
-                    display = get(EGL_PLATFORM_GBM_KHR, kms.device, std::ptr::null());
-                    ready = !display.is_null() && loaded.Initialize(display, &mut major, &mut minor) != 0;
+                    get(EGL_PLATFORM_GBM_KHR, kms.device, std::ptr::null())
                 }
+                None => loaded.GetDisplay(kms.device as glutin_egl_sys::EGLNativeDisplayType),
+            };
+            let mut ready = !display.is_null() && loaded.Initialize(display, &mut major, &mut minor) != 0;
+            if !ready && platform.is_some() {
+                // the blob has the platform entry point but would not take
+                // the device through it; its legacy eglGetDisplay is the one
+                // way in on older blobs, and returns no display for a GBM
+                // device on g29p1 (the RG52 Mini), where the call above works
+                display = loaded.GetDisplay(kms.device as glutin_egl_sys::EGLNativeDisplayType);
+                ready = !display.is_null() && loaded.Initialize(display, &mut major, &mut minor) != 0;
             }
             if !ready {
                 return Err(format!("could not initialize EGL on the GBM device, 0x{:X}, {}", loaded.GetError(), drawing_libraries()));
