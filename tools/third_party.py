@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""third_party.py <out>: the licenses of every crate built into pocket-native
-for the handheld, and of the fonts, into one file to ship beside it.
+"""third_party.py <out> [package target]: the licenses of every crate built
+into pocket-native for the handheld, or into the package for the target given
+as the Android app, and of the fonts, into one file to ship beside it.
 
 Reads `cargo metadata` from the repository and each crate's license files
 from where cargo unpacked it.
@@ -30,12 +31,13 @@ generated from Montserrat (SIL Open Font License 1.1) and GNU Unifont 10.0.05
 
 def main():
     out = pathlib.Path(sys.argv[1])
+    name, target = sys.argv[2:4] if len(sys.argv) > 3 else ("pocket-native", TARGET)
     metadata = json.loads(subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", TARGET],
+        ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", target],
         check=True, stdout=subprocess.PIPE).stdout.decode("utf-8"))
     packages = {package["id"]: package for package in metadata["packages"]}
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
-    root = next(id for id, package in packages.items() if package["name"] == "pocket-native")
+    root = next(id for id, package in packages.items() if package["name"] == name)
 
     # what ends up in the program: normal dependencies, all the way down
     built, waiting = set(), [root]

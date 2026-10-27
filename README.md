@@ -1,186 +1,152 @@
 # Pocket Native
 
-If you have not used it before, [start here](START_HERE.md). The short
-version: there is no app to install and no game included, a PC rebuilds
-each game first (drop it on `Build a game`).
+Nintendo 3DS games on cheap handhelds and Android, rebuilt for them
+instead of emulated.
 
-Nintendo 3DS games, recompiled, running natively on cheap
-Linux handhelds. Made for the R36S and its Mali-G31 GPU under ArkOS.
+**[Start here](START_HERE.md)** to play · [Which games work](docs/compatibility.md) ·
+[Latest release](https://github.com/whovian64/pocket-native/releases/latest)
 
-Pocket Native is a fork of [Zakuro](https://github.com/fearkov/zakuro) and
-[3dsrecomp](https://github.com/fearkov/3dsrecomp) by fearkov. Zakuro is a
-3DS emulator that runs a game's code recompiled to C instead of through a
-JIT, and it does the heavy lifting here. This fork adds:
+## Now on Android
 
-- an OpenGL ES 3.1 renderer for the handheld's GPU, tuned for Mali (the
-  R36S has no Vulkan driver)
-- a frontend for handhelds without a desktop: the screens go to the panel
-  through KMS, buttons come from evdev, sound goes out through ALSA
-- an in-game menu for layout, frame rate, power, controls and per-game
-  settings, with a line of help for every setting
-- per-game profiles in `titles/`, and a probe mode for trying new games
-- a build that turns your own game dump into a folder for the SD card:
-  drop the game on `Build a game`, on Windows or Linux
-- an updater that brings the kit up to the latest release and builds
-  your games again with it
+Pocket Native now runs on Android too, on one screen or two, thanks to
+[gopnikcosmoslav2077](https://github.com/gopnikcosmoslav2077), who
+brought up the Android port almost single-handedly
+([#8](https://github.com/whovian64/pocket-native/pull/8)). It's been
+tested on Samsung and Google phones, the AYN Thor and Anbernic's RG DS
+running Android. Your PC still builds the games and the app plays them.
 
-The Android app and the Vulkan renderer of upstream Zakuro are not part of
-this fork.
+## How it works
+
+An emulator translates a game's code while you play, and a $40 handheld
+doesn't have the power to spare for that on top of a 3DS game. Pocket
+Native does the translating once, on your PC. It recompiles each game's
+code ahead of time into a native program for the handheld's CPU. What
+runs on the handheld is that program, plus the parts of an emulator the
+game still needs: the 3DS's system services, its GPU redone in OpenGL
+ES, sound, and a frontend made for handhelds.
+
+That's enough even for an R36S, a quad Cortex-A35 with a Mali-G31 and
+1 GB of RAM.
+
+You bring your own games: **no game data is included**, and Pocket
+Native only works with games dumped from your own console. **No
+precompiled shaders are included either**, so each game builds its own
+the first time it runs.
+
+Pocket Native is a fork of [Zakuro](https://github.com/fearkov/zakuro),
+a 3DS emulator built to run recompiled code, and
+[3dsrecomp](https://github.com/fearkov/3dsrecomp), its recompiler, both
+by fearkov. On top of them it adds:
+
+- an OpenGL ES 3.1 renderer, tuned for Mali GPUs with no Vulkan driver
+- a frontend for handhelds with no desktop: KMS or the framebuffer for
+  the screens, evdev for the buttons, ALSA for sound
+- an in-game menu for layouts, frame cap, power, controls and per-game
+  settings
+- per-game profiles in `titles/`, and a probe mode for trying games
+- a kit that builds your games on Windows or Linux with one drop on
+  `Build a game`, and updates itself
+- a lot of performance work for low-powered handhelds and Android
 
 ## Games
 
-Tested and tuned on the R36S:
+Pokémon Omega Ruby and Alpha Sapphire are the showcase and play well.
+Pokémon X and Y, Sun and Moon, Animal Crossing: New Leaf and Mario Kart
+7 are playable, and plenty more get somewhere. It's early days: a game
+nobody has tried may not boot at all.
 
-- Pokémon Omega Ruby and Alpha Sapphire
-- Animal Crossing: New Leaf (US version)
-- Mario Kart 7 (US version)
+The [compatibility list](docs/compatibility.md) has what's known for
+each game. Tried one that isn't on it? Please
+[open an issue](https://github.com/whovian64/pocket-native/issues),
+working or not.
 
-Other games may or may not boot. See [docs/games.md](docs/games.md) for
-trying a game and adding a profile for it.
+## Handhelds
 
-## What you need
+| Handheld | System | State |
+|---|---|---|
+| R36S and its clones | ArkOS, dArkOS, dArkOSRE, ArkOS and dArkOS for clones | The main target, developed and tested on an R36S with ArkOS |
+| Powkiddy RX6H | dArkOS for clones | Played by testers. No FN button: L3 does its job |
+| Anbernic H700 handhelds: RG35XX and RG40XX families, RG CubeXX | Knulli, muOS | Played by testers |
+| Anbernic RG353 and RG503 | ArkOS | Buttons mapped, no tester report yet |
+| Anbernic RG52 Mini | dArkOS | Played by testers |
+| Anbernic RG351P | ArkOS | Buttons not found yet |
+| AYN Thor | Android | Works, both screens |
+| Anbernic RG DS | Android | Works, both screens |
+| Anbernic RG DS | Anbernic's Linux | Not yet: one screen only, buttons not found |
+| Android phones | Android 11 or newer, 64-bit | Works, with touch controls or a gamepad |
+| AmberELEC, Rocknix | | Not yet |
 
-- An R36S (or a close clone) with ArkOS. dArkOSRE works too. Other
-  systems, dArkOS included, are untested.
-- A PC for the build: Linux with [podman](https://podman.io) or Docker, or
-  Windows with [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-  or [Podman Desktop](https://podman-desktop.io).
-- Your own dump of the game: a decrypted `.3ds`/`.cci`, or a `.cia` along
-  with your console's `aes_keys.txt`.
-
-No game data is included or downloaded. Pocket Native only works with games
-you dump from your own console.
-
-## Building
-
-Get the kit from the [latest release](https://github.com/whovian64/pocket-native/releases/latest)
-(**Source code**), or clone the repository. Then drop your games on
-`Build a game` in the kit's folder, or open it and pick them:
-`Build a game.bat` on Windows, `Build a game.desktop` on Linux. A `.cia`
-uses the `aes_keys.txt` next to it or in the kit's folder, and asks for
-it otherwise.
-
-From a terminal:
-
-```bash
-scripts/build.sh path/to/game.3ds
-scripts/build.sh path/to/game.cia --keys path/to/aes_keys.txt
-```
-
-On Windows, `scripts\build.ps1` takes the same from PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1 path\to\game.3ds
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1 path\to\game.cia -Keys path\to\aes_keys.txt
-```
-
-Several games can be built at once.
-
-Docker Desktop has to be running.
-
-The first build sets up the build container, which downloads a few hundred
-MB (Ubuntu packages, Rust, crates) and takes a while. Each game's code is
-recompiled to C and compiled for the handheld, which takes several minutes
-for a big game. Later builds reuse what they can.
-
-The result is a `Pocket Native` folder in `build/` (or wherever `--out` or
-`-Out` points), with the game in it. Building more games into the same folder adds
-them next to each other, one launcher each.
-
-## Updating
-
-A build ends by saying when a newer release is out. `Update Pocket Native`
-in the kit's folder, or `scripts/update.sh` (`scripts\update.ps1` on
-Windows), downloads it into the kit, moves the kit's old files to `.old`,
-and builds every game in `build/` again from the copies the last build
-left there. A git clone is updated with `git pull` instead. `--out`/`-Out`
-points it at another output folder. The menu shows the version running,
-next to "Pocket Native" at the top.
-
-## Installing
-
-1. Copy the `Pocket Native` folder into `ports` on the card's game
-   partition (`roms/ports`, or `roms2/ports` with two cards).
-2. Restart EmulationStation. Each game shows up under Ports.
-
-To start games from EmulationStation's 3DS list instead, set the 3DS
-system's `<command>` in `/etc/emulationstation/es_systems.cfg` to run
-`3ds.sh`, for example:
-
-```xml
-<command>"/roms2/ports/Pocket Native/pocket-native/3ds.sh" %ROM%</command>
-```
-
-`3ds.sh` reads the title ID from the ROM it is given and starts that game's
-build, so each game still has to be built first.
-
-Saves, the game's own settings and its log go in
-`Pocket Native/pocket-native/games/<title id>/data`, everything else in
-`Pocket Native/pocket-native/config`.
+Screens other than the R36S's 640x480 work: the layouts follow the
+panel's shape (16:9, square, 1024x768), and **Display > Rotation** turns
+the picture for a panel mounted sideways.
 
 ## Controls
 
 | Handheld | 3DS |
 |---|---|
-| A / B / X / Y | A / B / X / Y (Xbox layout in the menu) |
+| A / B / X / Y | A / B / X / Y |
 | L1 / R1 | L / R |
 | D-pad | D-pad |
-| Left stick | Circle pad (or the D-pad, in the menu) |
+| Left stick | Circle pad, or the D-pad (Controls in the menu) |
 | Right stick | Moves the touch cursor |
-| R2 or R3 | Touches the screen under the cursor |
+| R2 | Touches the bottom screen under the cursor |
+| R3 | Switches the right stick to the C-stick, with L2 and R2 as ZL and ZR, and back |
 | L2 held + right stick | Tilts the console, for games that use motion |
 | Start / Select | Start / Select |
 
 | Hotkey | Does |
 |---|---|
-| Tap FN, or L3 + R2 | Opens the menu and pauses the game |
+| Tap FN, or L3 + R2 | Opens the menu and pauses |
 | FN + Start | Quits |
 | Tap L2, or FN + L1 | Swaps the screens |
 | FN + R1 | Switches between both screens and one big screen |
+| FN + Select | Switches the D-pad between D-pad, circle pad and touch cursor |
+
+On a handheld with no FN button, L3 does what FN does.
+
+On Android, the touch controls cover all of this, with a Menu button in
+place of FN, and hide while you use a gamepad. **Controls > Edit touch
+controls** in the menu moves and resizes them, separately for holding
+the device upright and sideways.
 
 ## The menu
 
-- **Display:** screen layout, smooth scaling, frame interpolation, fps and
-  temperature in the bottom right corner, battery and a 12-hour clock in
-  the bottom left
+Every setting has a line of help at the bottom of the menu.
+
+- **Display:** layout (big top, side by side, one screen, original size
+  and more), aspect ratio, render resolution, smooth scaling, frame
+  interpolation, fps counter, clock and battery, rotation
 - **Performance:** frame cap (20, 30 or 60) and power (saver, balanced,
   performance)
-- **This game:** options from the game's profile
-- **Controls:** touch cursor speed, Nintendo or Xbox button layout, left
-  stick as circle pad or D-pad, tilt reversed left and right or up and down
+- **This game:** options from the game's profile, where it has some
+- **Controls:** touch cursor speed, Nintendo or Xbox A/B, left stick as
+  circle pad or D-pad, the D-pad's job, tilt directions, and the touch
+  controls on Android
 - **Game:** resume, advanced settings, reset, quit
 
-The selected setting's help shows at the bottom of the menu.
-
-**Frame interpolation** adds an in-between frame for games running below
-the target, up to 30 or 60 fps. Up to 60 doubles a 30 fps game; up to 30
-doubles a 15 fps one and costs half the GPU time. It tracks motion in 16
-pixel blocks and blends where it can't, so slow scenes come out smooth and
-fast ones can smear thin details. It pauses while the game is skipping
-frames, and it is off by default.
-
 **Advanced settings** are saved per game. They switch the engine's speed
-hacks and graphics, CPU and loading options for a game that doesn't run or
-look right, and set the console language and region the game is told. **Most compatible** turns off every speed hack a game could
-trip over in one go; if that fixes it, turn them back on one at a time to
-find the culprit. Settings under a "requires restart" heading take effect
-after **Restart game**, and **Reset to defaults** goes back to what the
-game's profile asks for. [docs/games.md](docs/games.md) lists them all.
+hacks and its graphics, CPU and loading options for a game that doesn't
+run or look right, and set the language and region the game is told.
+**Most compatible** turns off every speed hack at once: if that fixes a
+game, turn them back on one at a time to find the one it trips over.
+Settings under a "requires restart" heading need **Restart game**.
 
-## Layout
+**Frame interpolation** draws an in-between picture for a game running
+below the target, up to 30 or 60 fps. It follows motion in 16 pixel
+blocks, so slow scenes come out smooth and fast ones can smear thin
+details. It's off by default.
 
-| Path | What is in it |
+## For developers
+
+| Path | What's in it |
 |---|---|
-| `engine/` | The Zakuro emulator: CPU, GPU, file systems, OS services |
+| `engine/` | The Zakuro emulator: CPU, GPU, file systems, system services |
 | `engine/gpu/src/raster/gles.rs` | The OpenGL ES renderer |
 | `recompiler/` | 3dsrecomp, which turns a game's code into C |
 | `frontend/` | The `pocket-native` program: panel, input, sound, menu, probe |
 | `titles/<title id>/` | Per-game profiles and hand-written code overrides |
-| `scripts/` | The build (`build.sh`, `container/`) and what runs on the handheld (`device/`) |
-| `tools/` | Build helpers: title IDs, `.cia` decryption, the system font, third-party licenses |
-| `assets/fonts/` | The menu font |
-
-## Development
+| `scripts/` | The kit's build (`build.sh`, `container/`) and what runs on the handheld (`device/`) |
+| `tools/` | Build helpers: title IDs, `.cia` decryption, the system font, licenses |
 
 Pocket Native builds and runs on a Linux PC too, with Mesa's OpenGL ES:
 
@@ -189,19 +155,19 @@ cargo build --release -p pocket-native
 cargo test --workspace --features zakuro-gpu/gles
 ```
 
-Without a panel, `ZAKURO_PANEL_SHOT=file.ppm` draws offscreen and saves
-what the panel would show (a `%` in the name numbers every frame instead).
-`--probe` runs a game without input and writes a report, see
-[docs/games.md](docs/games.md).
+With no panel, `ZAKURO_PANEL_SHOT=file.ppm` draws offscreen and saves
+what the panel would show (a `%` in the name saves every frame).
+`--probe` runs a game unattended and writes a report.
+[docs/games.md](docs/games.md) covers probing a game, writing its
+profile and the advanced settings a profile can set.
 
 ## Credits and license
 
-See [CREDITS.md](CREDITS.md). Pocket Native is under the MIT license, like
-Zakuro, see [LICENSE](LICENSE). The menu font is under the SIL Open Font
-License, see [assets/fonts/OFL.txt](assets/fonts/OFL.txt). Every build also
-puts `LICENSE`, `CREDITS.md`, `OFL.txt` and `THIRD_PARTY_LICENSES.txt` (the
-licenses of the Rust crates built into the program and of the fonts) in
-`Pocket Native/pocket-native`.
+See [CREDITS.md](CREDITS.md). Pocket Native is under the MIT license,
+like Zakuro, see [LICENSE](LICENSE). The menu font is under the SIL
+Open Font License, see [assets/fonts/OFL.txt](assets/fonts/OFL.txt).
+Every build also puts `LICENSE`, `CREDITS.md`, `OFL.txt` and
+`THIRD_PARTY_LICENSES.txt` in `Pocket Native/pocket-native`.
 
-Pocket Native is not affiliated with or endorsed by Nintendo. Nintendo 3DS
-and the game names are trademarks of their owners.
+Pocket Native is not affiliated with or endorsed by Nintendo. Nintendo
+3DS and the game names are trademarks of their owners.

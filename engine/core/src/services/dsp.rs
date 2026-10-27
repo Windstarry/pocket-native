@@ -83,11 +83,69 @@ pub struct DspState {
     mixer: super::dsp_mixer::Mixer,
     /// what came out of the speakers since the frontend last took it.
     pub output: Vec<[i16; 2]>,
+    /// the thread mixing frames, when there is one.
+    sound_thread: Option<SoundThread>,
     pub(crate) aac: super::dsp_aac::Aac,
 }
 
 /// the most output kept for a frontend that is not taking it, a second.
 const MAX_OUTPUT: usize = 32_768;
+
+/// the DSP's mixing on a thread of its own, as the console's DSP mixes
+/// beside its CPU: a frame goes out to it once the voices played it, which
+/// is all a title reads back, and comes back mixed by the next.
+struct SoundThread {
+    jobs: std::sync::mpsc::Sender<(Vec<super::dsp_voices::VoiceMix>, super::dsp_mixer::Levels)>,
+    frames: std::sync::mpsc::Receiver<super::dsp_voices::Frame>,
+    /// the region the frame out on the thread is played into, when one is.
+    out: Option<u32>,
+}
+
+/// mixes frames on a thread of its own from here on.
+pub fn start_sound_thread(dsp: &mut DspState) {
+    if dsp.sound_thread.is_some() {
+        return;
+    }
+    let (jobs, receiver) = std::sync::mpsc::channel::<(Vec<super::dsp_voices::VoiceMix>, super::dsp_mixer::Levels)>();
+    let (done, frames) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().name("sound".into()).spawn(move || {
+        for (mixing, levels) in receiver {
+            if done.send(super::dsp_mixer::final_mix(&super::dsp_voices::mix(&mixing), levels)).is_err() {
+                return;
+            }
+        }
+    });
+    match spawned {
+        Ok(_) => dsp.sound_thread = Some(SoundThread { jobs, frames, out: None }),
+        Err(error) => log::warn!("no sound thread, mixing on the title's, {error}"),
+    }
+}
+
+/// takes the frame the sound thread mixed, when one is out.
+pub fn collect(system: &mut System) {
+    let Some(thread) = &mut system.services.dsp.sound_thread else { return };
+    let Some(write) = thread.out.take() else { return };
+    let Ok(frame) = thread.frames.recv() else { return };
+    super::dsp_mixer::write_final(&mut system.memory, mixer_layout(), write, &frame);
+    play(&mut system.services.dsp, &frame);
+}
+
+fn mixer_layout() -> super::dsp_mixer::Layout {
+    super::dsp_mixer::Layout {
+        configuration: dsp_dram_to_arm(layout::DSP_CONFIGURATION),
+        final_samples: dsp_dram_to_arm(layout::FINAL_SAMPLES),
+        intermediate_samples: dsp_dram_to_arm(layout::INTERMEDIATE_MIX_SAMPLES),
+    }
+}
+
+/// what the speakers play, kept for the frontend.
+fn play(dsp: &mut DspState, frame: &super::dsp_voices::Frame) {
+    dsp.output.extend_from_slice(frame);
+    if dsp.output.len() > MAX_OUTPUT {
+        let excess = dsp.output.len() - MAX_OUTPUT;
+        dsp.output.drain(..excess);
+    }
+}
 
 impl DspState {
     fn reset_pipes(&mut self) {
@@ -247,8 +305,12 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         // RegisterInterruptEvents(interrupt, channel, event handle)
         REGISTER_INTERRUPT_EVENTS => {
             let handle = buffer.get(&mut system.memory, 4);
+            // kept until the title is done, whatever it does with its handle
             if let Some(object) = system.kernel.resolve(handle) {
-                system.services.dsp.interrupt_events.push(object);
+                if !system.services.dsp.interrupt_events.contains(&object) {
+                    system.kernel.objects.add_ref(object);
+                    system.services.dsp.interrupt_events.push(object);
+                }
             }
             buffer.reply(&mut system.memory, id, &[]);
             true
@@ -335,20 +397,22 @@ pub fn advance(system: &mut System) {
         coefficients: dsp_dram_to_arm(layout::ADPCM_COEFFICIENTS),
         frame_counter: dsp_dram_to_arm(layout::FRAME_COUNTER),
     };
-    let mixer = super::dsp_mixer::Layout {
-        configuration: dsp_dram_to_arm(layout::DSP_CONFIGURATION),
-        final_samples: dsp_dram_to_arm(layout::FINAL_SAMPLES),
-        intermediate_samples: dsp_dram_to_arm(layout::INTERMEDIATE_MIX_SAMPLES),
-    };
+    let mixer = mixer_layout();
+    collect(system);
     let read = super::dsp_voices::current_region(&mut system.memory, voices);
     let dsp = &mut system.services.dsp;
-    let mixes = dsp.voices.tick(&mut system.memory, voices);
-    let frame = dsp.mixer.tick(&mut system.memory, mixer, read, mixes);
-    dsp.output.extend_from_slice(&frame);
-    if dsp.output.len() > MAX_OUTPUT {
-        let excess = dsp.output.len() - MAX_OUTPUT;
-        dsp.output.drain(..excess);
+    let mixing = dsp.voices.tick(&mut system.memory, voices);
+    dsp.mixer.read_config(&mut system.memory, mixer, read);
+    // the mixes a title processes itself go through its memory now, the
+    // rest can be mixed while it goes on
+    if let Some(thread) = dsp.sound_thread.as_mut().filter(|_| !dsp.mixer.uses_aux()) {
+        if thread.jobs.send((mixing, dsp.mixer.levels())).is_ok() {
+            thread.out = Some(1 - read);
+        }
+        return;
     }
+    let frame = dsp.mixer.finish(&mut system.memory, mixer, read, super::dsp_voices::mix(&mixing));
+    play(dsp, &frame);
 }
 
 /// signals the DSP's interrupt events, as the firmware does at the end of

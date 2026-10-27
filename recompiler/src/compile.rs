@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// nothing may be fused into a multiply-add.
 const FLAGS: &[&str] = &["-O2", "-ffp-contract=off", "-fno-math-errno", "-w"];
 /// what only matters for ELF and Mach-O, and that compilers for Windows
-/// refuse or ignore.
-const UNIX_FLAGS: &[&str] = &["-fPIC", "-fvisibility=hidden"];
+/// refuse or ignore. no stack protector, which would tie the code to one C
+/// library: it calls none, so one build loads on glibc and Android alike.
+const UNIX_FLAGS: &[&str] = &["-fPIC", "-fvisibility=hidden", "-fno-stack-protector"];
 
 /// what progress hears after each file, how many are done and of how
 /// many, answering whether to go on.
@@ -118,7 +119,15 @@ pub fn shared(objects: &[PathBuf], library: &Path) -> Result<(), String> {
     if cfg!(windows) && compiler.contains("gcc") {
         command.arg("-static-libgcc");
     }
-    let status = command.arg("-shared").arg("-o").arg(library).args(objects).status();
+    // nothing from a C library, gcc's own helpers linked in after the code
+    if !cfg!(windows) {
+        command.arg("-nostdlib");
+    }
+    command.arg("-shared").arg("-o").arg(library).args(objects);
+    if !cfg!(windows) && compiler.contains("gcc") {
+        command.arg("-lgcc");
+    }
+    let status = command.status();
     match status {
         Ok(status) if status.success() => Ok(()),
         _ => Err("linking failed".to_owned()),

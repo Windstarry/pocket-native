@@ -1,6 +1,7 @@
 //! high-level service emulation.
 
 pub mod apt;
+pub mod boss;
 pub mod cam;
 pub mod cecd;
 pub mod err;
@@ -15,8 +16,10 @@ pub mod glyphs;
 pub mod gsp;
 pub mod hid;
 pub mod ir;
+pub mod ir_rst;
 pub mod keyboard;
 pub mod ldr_ro;
+pub mod mii_selector;
 pub mod misc;
 pub mod nfc;
 pub mod shared_font;
@@ -66,9 +69,11 @@ pub struct ServiceState {
     pub fs: fs::FsState,
     pub dsp: dsp::DspState,
     pub ir: ir::IrState,
+    pub ir_rst: ir_rst::IrRstState,
     pub y2r: y2r::Y2rState,
     pub nfc: nfc::NfcState,
     pub cecd: cecd::CecdState,
+    pub boss: boss::BossState,
     pub cam: cam::CamState,
     /// commands we logged as unimplemented, so the log stays readable and the
     /// diagnostics overlay can show what a title is actually asking for.
@@ -102,10 +107,12 @@ pub fn handle_request(system: &mut System, target: Target) {
         "dsp::DSP" => dsp::handle(system, &buffer, header),
         "ldr:ro" => ldr_ro::handle(system, &buffer, header),
         "ir:USER" => ir::handle(system, &buffer, header),
+        "ir:rst" => ir_rst::handle(system, &buffer, header),
         "y2r:u" => y2r::handle(system, &buffer, header),
         "frd:u" | "frd:a" => frd::handle(system, &buffer, header),
         "nfc:u" | "nfc:m" => nfc::handle(system, &buffer, header),
         "cecd:u" | "cecd:s" => cecd::handle(system, &buffer, header),
+        "boss:U" | "boss:P" => boss::handle(system, &buffer, header),
         "cam:u" => cam::handle(system, &buffer, header),
         _ => misc::handle(system, &buffer, header, &name),
     };
@@ -146,7 +153,6 @@ fn is_network_service(name: &str) -> bool {
     matches!(
         name,
         "frd:u" | "frd:a"
-            | "boss:U" | "boss:P"
             | "nwm::UDS"
             | "http:C"
             | "ssl:C"
@@ -213,13 +219,38 @@ pub fn unimplemented(system: &mut System, buffer: &CommandBuffer, header: Header
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Config;
 
     /// a system with one running thread, whose TLS holds the command buffer
     /// a request is read from and replied into.
-    fn system_with_thread() -> (System, CommandBuffer) {
+    /// no library applet is there until the title prepares one, a title
+    /// told one is there cancels it and waits for it to close, Yo-kai Watch
+    /// 2 as it started. the applets a title names are there.
+    #[test]
+    fn a_library_applet_is_there_only_once_prepared() {
+        let (mut system, buffer) = system_with_thread();
+        let is_registered = |system: &mut System, applet: u32| {
+            buffer.set(&mut system.memory, 0, Header::new(0x0009, 1, 0).0);
+            buffer.set(&mut system.memory, 1, applet);
+            handle_request(system, Target::service("APT:A".into(), 0));
+            assert_eq!(buffer.get(&mut system.memory, 1), 0);
+            buffer.get(&mut system.memory, 2)
+        };
+        assert_eq!(is_registered(&mut system, 0x400), 0);
+        assert_eq!(is_registered(&mut system, 0x402), 0);
+        assert_eq!(is_registered(&mut system, 0x101), 1);
+        // PrepareToStartLibraryApplet(software keyboard)
+        buffer.set(&mut system.memory, 0, Header::new(0x0018, 1, 0).0);
+        buffer.set(&mut system.memory, 1, 0x401);
+        handle_request(&mut system, Target::service("APT:A".into(), 0));
+        assert_eq!(is_registered(&mut system, 0x400), 1);
+        assert_eq!(is_registered(&mut system, 0x401), 1);
+        assert_eq!(is_registered(&mut system, 0x402), 0);
+    }
+
+    pub(crate) fn system_with_thread() -> (System, CommandBuffer) {
         let mut system = System::new(Config::default());
         let id = system
             .kernel
@@ -434,5 +465,43 @@ mod tests {
         handle_request(&mut system, apt());
         assert_eq!(receive(&mut system)[..4], [0, 0x406, 10, 0x40], "and closes, handing back a result");
         assert!(system.services.unimplemented.is_empty());
+    }
+
+    /// the Mii selector answers with the console's Mii. a title that saves a
+    /// blank one takes the file for a new one at the next boot, Super Mario
+    /// 3D Land does.
+    #[test]
+    fn the_mii_selector_picks_the_consoles_mii() {
+        use crate::kernel::ipc::Descriptor;
+        use zakuro_common::memory_map::TLS_IPC_STATIC_BUFFERS;
+
+        let (mut system, buffer) = system_with_thread();
+        let tls = system.kernel.current().unwrap().tls;
+        let page = tls & !0xFFF;
+        let apt = || Target::service("APT:U".into(), 0);
+        let word = |value: u32| value.to_le_bytes();
+        system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS, &word(Descriptor::static_buffer(0x100, 0)));
+        system.memory.write_bytes(tls + TLS_IPC_STATIC_BUFFERS + 4, &word(page + 0xC00));
+
+        // StartLibraryApplet(Mii selector, size, handle, buffer)
+        buffer.set(&mut system.memory, 0, Header::new(0x001E, 2, 4).0);
+        for (i, value) in [0x402, 0x104, 0, 0, Descriptor::static_buffer(0x104, 0), page + 0x800]
+            .into_iter()
+            .enumerate()
+        {
+            buffer.set(&mut system.memory, i as u32 + 1, value);
+        }
+        handle_request(&mut system, apt());
+
+        // ReceiveParameter(application, size)
+        buffer.set(&mut system.memory, 0, Header::new(0x000D, 2, 0).0);
+        buffer.set(&mut system.memory, 1, 0x300);
+        buffer.set(&mut system.memory, 2, 0x100);
+        handle_request(&mut system, apt());
+        let reply: Vec<u32> = (1..=4).map(|i| buffer.get(&mut system.memory, i)).collect();
+        assert_eq!(reply, [0, 0x402, 10, 0x84]);
+        let mut answer = vec![0; 0x84];
+        system.memory.read_bytes(page + 0xC00, &mut answer);
+        assert_eq!(answer, mii_selector::result());
     }
 }

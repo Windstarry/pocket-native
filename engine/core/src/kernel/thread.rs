@@ -114,6 +114,9 @@ pub struct Thread {
     pub context: ThreadContext,
     /// 0 is the highest priority, 0x3F the lowest.
     pub priority: u32,
+    /// the priority the thread was given. priority is this, or higher while
+    /// a thread waiting on a mutex it holds lends it its own.
+    pub base_priority: u32,
     pub status: ThreadStatus,
 
     pub entry: VAddr,
@@ -178,6 +181,7 @@ impl Thread {
             name: name.into(),
             context: ThreadContext::new(entry, stack_top, arg, tls),
             priority,
+            base_priority: priority,
             status: ThreadStatus::Ready,
             entry,
             stack_top,

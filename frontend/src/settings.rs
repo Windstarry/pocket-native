@@ -14,6 +14,54 @@ pub enum Layout {
     TopOnly,
     SideBySide,
     Original,
+    BigBeside,
+}
+
+/// the screens stretched over the display they are on rather than kept in
+/// shape, with a screen on each display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Stretch {
+    #[default]
+    Off,
+    Top,
+    Bottom,
+    Both,
+}
+
+impl Stretch {
+    pub const ALL: [Stretch; 4] = [Stretch::Off, Stretch::Top, Stretch::Bottom, Stretch::Both];
+
+    /// whether the top screen, or else the bottom one, is stretched.
+    pub fn stretches(self, top: bool) -> bool {
+        matches!((self, top), (Stretch::Both, _) | (Stretch::Top, true) | (Stretch::Bottom, false))
+    }
+}
+
+/// the screens' shape: the top one's as on the console, scaled by whole
+/// pixels, made narrower or wider, or both stretched over the room they have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Aspect {
+    #[default]
+    Original,
+    Integer,
+    FourThree,
+    SixteenTen,
+    SixteenNine,
+    Stretch,
+}
+
+impl Aspect {
+    pub const ALL: [Aspect; 6] = [Aspect::Original, Aspect::Integer, Aspect::FourThree, Aspect::SixteenTen, Aspect::SixteenNine, Aspect::Stretch];
+
+    /// the top screen's width over its height.
+    pub fn ratio(self) -> f32 {
+        match self {
+            Aspect::FourThree => 4.0 / 3.0,
+            Aspect::SixteenTen => 16.0 / 10.0,
+            Aspect::SixteenNine => 16.0 / 9.0,
+            Aspect::Original | Aspect::Integer | Aspect::Stretch => 5.0 / 3.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +90,29 @@ pub enum Stick {
     Dpad,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Dpad {
+    Dpad,
+    CirclePad,
+    Touch,
+}
+
+/// the right stick as the touch cursor, or as the New 3DS's C-stick with L2
+/// and R2 as ZL and ZR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RightStick {
+    Cursor,
+    CStick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Rotation {
+    Auto,
+    Clockwise,
+    CounterClockwise,
+    Off,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -49,21 +120,39 @@ pub struct Settings {
     /// the bottom screen in the top one's place.
     pub swapped: bool,
     pub smooth: bool,
+    /// with a screen on each display, which of them fill their displays
+    /// rather than keep their shape with bars.
+    pub stretched: Stretch,
+    pub aspect: Aspect,
+    /// how many times the console's resolution the GPU draws at, in
+    /// quarters from 1 to 3.5, from the next start.
+    pub resolution: f32,
     /// pictures a second the panel is filled up to with ones halfway
     /// between each two of the top screen's, 30 or 60, 0 for none.
     pub interpolate_to: u32,
     pub show_fps: bool,
     /// the battery and the time under the screens.
     pub show_clock: bool,
+    /// the picture turned onto a sideways panel, as ZAKURO_PANEL_ROTATE
+    /// does, which Auto leaves to.
+    pub rotation: Rotation,
     pub frame_cap: u32,
     pub power: Power,
     pub touch_speed: Speed,
     pub buttons: Buttons,
     pub left_stick: Stick,
+    /// the d-pad as the circle pad or the touch cursor, for handhelds short
+    /// of sticks.
+    pub dpad: Dpad,
+    /// the right stick as the touch cursor or the C-stick, R3 switching it.
+    pub right_stick: RightStick,
     /// tilting with L2 and the right stick the other way, left and right
     /// or up and down.
     pub reverse_tilt_x: bool,
     pub reverse_tilt_y: bool,
+    /// buttons and sticks drawn over the screens, for a touch screen with
+    /// no gamepad.
+    pub touch_controls: bool,
 }
 
 impl Default for Settings {
@@ -72,16 +161,23 @@ impl Default for Settings {
             layout: Layout::BigTop,
             swapped: false,
             smooth: true,
+            stretched: Stretch::Off,
+            aspect: Aspect::Original,
+            resolution: 1.0,
             interpolate_to: 0,
             show_fps: false,
             show_clock: true,
+            rotation: Rotation::Auto,
             frame_cap: 30,
             power: Power::Performance,
             touch_speed: Speed::Normal,
             buttons: Buttons::Nintendo,
             left_stick: Stick::CirclePad,
+            dpad: Dpad::Dpad,
+            right_stick: RightStick::Cursor,
             reverse_tilt_x: false,
             reverse_tilt_y: false,
+            touch_controls: cfg!(target_os = "android"),
         }
     }
 }
@@ -106,8 +202,8 @@ impl Default for GameSettings {
 }
 
 /// the engine's speed hacks, each of which a game may not get along with. all
-/// but skip_bottom, frame_skip and shown_only take effect when the game
-/// starts.
+/// but skip_bottom, skip_right_eye, frame_skip and shown_only take effect
+/// when the game starts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Advanced {

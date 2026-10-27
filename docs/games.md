@@ -1,8 +1,10 @@
 # Trying a game
 
-Pocket Native runs any 3DS game Zakuro can boot. Most games outside the
-tested list will hit something the emulator does not do yet. Nothing in it
-is specific to one game: a game without a profile simply runs without one.
+Pocket Native runs any 3DS game Zakuro can boot, and nothing in it is
+specific to one game: a game without a profile simply runs without one.
+What's known about each game is on the
+[compatibility list](compatibility.md). This page is for trying one that
+isn't, and for writing its profile.
 
 ## Building it
 

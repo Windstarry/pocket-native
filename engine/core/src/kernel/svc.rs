@@ -423,6 +423,11 @@ const YIELD_TICKS: u64 = 20_000;
 fn sleep_thread(system: &mut System) {
     let nanos = (system.cpu.regs[0] as u64) | ((system.cpu.regs[1] as u64) << 32);
     let tick = system.cpu.cycles;
+    // a negative time returns at once on the console, without yielding
+    if (nanos as i64) < 0 {
+        system.cpu.regs[0] = 0;
+        return;
+    }
     // a zero sleep is a yield, and while other threads are ready the
     // kernel runs them for a while even when their priority is lower,
     // titles polling a worker thread that way would spin forever otherwise
@@ -453,8 +458,11 @@ fn set_thread_priority(system: &mut System) {
     let priority = system.cpu.regs[1];
     match resolve_thread(system, handle) {
         Some(id) => {
-            system.kernel.thread_mut(id).priority = priority.min(super::LOWEST_PRIORITY);
+            let thread = system.kernel.thread_mut(id);
+            thread.base_priority = priority.min(super::LOWEST_PRIORITY);
+            thread.priority = thread.base_priority;
             system.kernel.reschedule_pending = true;
+            system.kernel.priorities_stale = true;
             system.cpu.regs[0] = 0;
         }
         None => system.cpu.regs[0] = invalid_handle(system, handle, "svcSetThreadPriority"),
@@ -509,11 +517,18 @@ fn release_mutex(system: &mut System) {
         system.cpu.regs[0] = invalid_handle(system, handle, "svcReleaseMutex");
         return;
     };
+    let current = system.kernel.current_thread;
     if let Some(KObject::Mutex(mutex)) = system.kernel.objects.get_mut(object) {
+        // only the thread holding it can let it go
+        if mutex.owner.is_none() || mutex.owner != current {
+            system.cpu.regs[0] = NOT_MUTEX_OWNER;
+            return;
+        }
         mutex.lock_count = mutex.lock_count.saturating_sub(1);
         if mutex.lock_count == 0 {
             mutex.owner = None;
             system.kernel.reschedule_pending = true;
+            system.kernel.priorities_stale = true;
         }
         system.cpu.regs[0] = 0;
     } else {
@@ -600,6 +615,7 @@ fn create_timer(system: &mut System) {
         fire_at: None,
         interval: 0,
     }));
+    system.kernel.timers.push(object);
     let handle = system
         .kernel
         .handles
@@ -609,19 +625,21 @@ fn create_timer(system: &mut System) {
 }
 
 /// svcSetTimer, r0 = handle, r2:r3 = initial delay, r1:r4 = interval, both
-/// in nanoseconds.
+/// in nanoseconds, a negative one taken as zero.
 fn set_timer(system: &mut System) {
     let handle = system.cpu.regs[0];
-    let initial = (system.cpu.regs[2] as u64) | ((system.cpu.regs[3] as u64) << 32);
-    let interval = (system.cpu.regs[1] as u64) | ((system.cpu.regs[4] as u64) << 32);
+    let nanos = |low: u32, high: u32| ((low as u64) | ((high as u64) << 32)) as i64;
+    let initial = nanos(system.cpu.regs[2], system.cpu.regs[3]).max(0) as u64;
+    let interval = nanos(system.cpu.regs[1], system.cpu.regs[4]).max(0) as u64;
     let now = system.cpu.cycles;
+    system.kernel.catch_up_timers(now);
 
     let Some(object) = system.kernel.resolve(handle) else {
         system.cpu.regs[0] = invalid_handle(system, handle, "svcSetTimer");
         return;
     };
     if let Some(KObject::Timer(timer)) = system.kernel.objects.get_mut(object) {
-        timer.fire_at = Some(now + nanos_to_ticks(initial));
+        timer.fire_at = Some(now.saturating_add(nanos_to_ticks(initial)));
         timer.interval = nanos_to_ticks(interval);
         timer.signaled = false;
         system.cpu.regs[0] = 0;
@@ -632,6 +650,7 @@ fn set_timer(system: &mut System) {
 
 fn cancel_timer(system: &mut System) {
     let handle = system.cpu.regs[0];
+    system.kernel.catch_up_timers(system.cpu.cycles);
     if let Some(object) = system.kernel.resolve(handle) {
         if let Some(KObject::Timer(timer)) = system.kernel.objects.get_mut(object) {
             timer.fire_at = None;
@@ -642,6 +661,7 @@ fn cancel_timer(system: &mut System) {
 
 fn clear_timer(system: &mut System) {
     let handle = system.cpu.regs[0];
+    system.kernel.catch_up_timers(system.cpu.cycles);
     if let Some(object) = system.kernel.resolve(handle) {
         if let Some(KObject::Timer(timer)) = system.kernel.objects.get_mut(object) {
             timer.signaled = false;
@@ -664,7 +684,7 @@ fn create_address_arbiter(system: &mut System) {
 }
 
 /// svcArbitrateAddress, r0 = handle, r1 = address, r2 = type, r3 = value,
-/// r4 = timeout in nanoseconds.
+/// r4:r5 = timeout in nanoseconds, a negative one waiting for good.
 fn arbitrate_address(system: &mut System) {
     let handle = system.cpu.regs[0];
     let address = system.cpu.regs[1];
@@ -673,7 +693,7 @@ fn arbitrate_address(system: &mut System) {
         return;
     };
     let value = system.cpu.regs[3] as i32;
-    let timeout_nanos = system.cpu.regs[4] as u64;
+    let timeout_nanos = ((system.cpu.regs[4] as u64) | ((system.cpu.regs[5] as u64) << 32)) as i64;
 
     let Some(object) = system.kernel.resolve(handle) else {
         system.cpu.regs[0] = invalid_handle(system, handle, "svcArbitrateAddress");
@@ -689,32 +709,33 @@ fn arbitrate_address(system: &mut System) {
 
     if kind == ArbitrationType::Signal {
         // wake up to value threads parked on this address, a negative value
-        // means all of them.
-        let mut woken = 0;
-        let unlimited = value < 0;
+        // means all of them. the console wakes the highest priority first,
+        // the one waiting longest among equals
+        let count = if value < 0 { usize::MAX } else { value as usize };
         let mut to_wake = Vec::new();
         let kernel = &mut system.kernel;
         let threads = &kernel.threads;
         if let Some(KObject::AddressArbiter(arbiter)) = kernel.objects.get_mut(object) {
+            // a thread whose wait timed out, or that ended since, left its
+            // entry behind, it goes without counting, a dead thread must
+            // never run again
             arbiter.waiters.retain(|&(thread, addr)| {
-                if addr != address {
-                    return true;
-                }
-                // a thread whose wait timed out, or that ended since, left its
-                // entry behind, it goes without counting, a dead thread must
-                // never run again
                 let parked = &threads[thread as usize];
-                if parked.status != ThreadStatus::WaitArbiter || parked.wait_address != Some(address) || to_wake.contains(&thread) {
-                    return false;
-                }
-                if unlimited || woken < value {
-                    woken += 1;
-                    to_wake.push(thread);
-                    false
-                } else {
-                    true
-                }
+                parked.status == ThreadStatus::WaitArbiter && parked.wait_address == Some(addr)
             });
+            while to_wake.len() < count {
+                let parked = arbiter.waiters.iter().enumerate().filter(|(_, &(_, addr))| addr == address);
+                let Some((next, _)) = parked.min_by_key(|(_, &(thread, _))| threads[thread as usize].priority) else {
+                    break;
+                };
+                to_wake.push(arbiter.waiters.remove(next).0);
+            }
+        }
+        // a signal that wakes nobody costs a thread of priority 50 or lower
+        // this long on the console, which keeps one spinning on it from
+        // starving the others
+        if to_wake.is_empty() && system.kernel.current().is_some_and(|thread| thread.priority >= 50) {
+            system.cpu.cycles += IDLE_SIGNAL_COST;
         }
         for thread in to_wake {
             let thread = system.kernel.thread_mut(thread);
@@ -750,8 +771,8 @@ fn arbitrate_address(system: &mut System) {
     let thread = system.kernel.thread_mut(thread_id);
     thread.clear_wait();
     thread.wait_address = Some(address);
-    thread.wakeup_at = if kind.has_timeout() {
-        Some(now + nanos_to_ticks(timeout_nanos))
+    thread.wakeup_at = if kind.has_timeout() && timeout_nanos >= 0 {
+        Some(now.saturating_add(nanos_to_ticks(timeout_nanos as u64)))
     } else {
         None
     };
@@ -763,6 +784,7 @@ fn arbitrate_address(system: &mut System) {
 /// svcWaitSynchronization1, r0 = handle, r2:r3 = timeout in nanoseconds.
 fn wait_synchronization1(system: &mut System) {
     let handle = system.cpu.regs[0];
+    system.kernel.catch_up_timers(system.cpu.cycles);
     let timeout = (system.cpu.regs[2] as u64) | ((system.cpu.regs[3] as u64) << 32);
     let signed_timeout = timeout as i64;
 
@@ -798,6 +820,7 @@ fn wait_synchronization1(system: &mut System) {
 /// svcWaitSynchronizationN, r0 = timeout low, r1 = handle array, r2 = count,
 /// r3 = wait-for-all, r4 = timeout high.
 fn wait_synchronization_n(system: &mut System) {
+    system.kernel.catch_up_timers(system.cpu.cycles);
     let handles_ptr = system.cpu.regs[1];
     let count = system.cpu.regs[2];
     let wait_all = system.cpu.regs[3] != 0;
@@ -949,7 +972,20 @@ fn get_system_tick(system: &mut System) {
     let tick = system.cpu.cycles;
     system.cpu.regs[0] = tick as u32;
     system.cpu.regs[1] = (tick >> 32) as u32;
+    // the call itself takes this long on the console, two in a row read
+    // ticks this far apart. a title spinning on the clock until a frame's
+    // time is up would otherwise spin many times longer
+    system.cpu.cycles += SYSTEM_TICK_COST;
 }
+
+/// ticks between two svcGetSystemTick calls in a row on the console.
+const SYSTEM_TICK_COST: u64 = 150;
+
+/// ticks an arbiter signal that wakes nobody takes on the console.
+const IDLE_SIGNAL_COST: u64 = 1614;
+
+/// what releasing a mutex another thread holds gives.
+const NOT_MUTEX_OWNER: u32 = 0xD8E0_041F;
 
 /// svcGetSystemInfo, r1 = type, r2 = parameter.
 fn get_system_info(system: &mut System) {
@@ -1130,3 +1166,21 @@ pub const THREAD_EXIT_ADDRESS: VAddr = THREAD_EXIT_MAGIC;
 /// unused placeholder keeping CURRENT_PROCESS referenced until process
 /// handles are wired up.
 pub const _CURRENT_PROCESS: u32 = CURRENT_PROCESS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// two reads of the clock in a row are as far apart as on the console,
+    /// so a title spinning on it until a frame is over spins no longer.
+    #[test]
+    fn reading_the_clock_takes_time() {
+        let mut system = System::new(crate::Config::default());
+        let mut read = || {
+            dispatch(&mut system, 0x28);
+            system.cpu.regs[0] as u64 | (system.cpu.regs[1] as u64) << 32
+        };
+        let first = read();
+        assert_eq!(read() - first, SYSTEM_TICK_COST);
+    }
+}

@@ -1,7 +1,7 @@
 //! virtual memory, the guest page table, and the [Bus] the CPU talks to.
 
 pub mod config;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod fastmem;
 pub mod physical;
 
@@ -84,8 +84,12 @@ pub struct Memory {
 
     /// the whole address space at once, for recompiled code, when the host
     /// can have it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     view: Option<fastmem::View>,
+
+    /// where the linear heap starts, the addresses the GPU's journal keeps
+    /// physical memory written by.
+    pub linear_base: VAddr,
 }
 
 // SAFETY: the pointers in the page tables all point into allocations owned by
@@ -102,15 +106,37 @@ impl Memory {
             mappings: BTreeMap::new(),
             faults: BTreeMap::new(),
             new_fault: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             view: fastmem::View::new(),
+            linear_base: 0,
+        }
+    }
+
+    pub fn with_linear_base(mut self, linear_base: VAddr) -> Memory {
+        self.linear_base = linear_base;
+        self
+    }
+
+    /// whether the GPU can read an address, the linear heap and VRAM are
+    /// all it is given.
+    fn gpu_reads(&self, vaddr: VAddr) -> bool {
+        vaddr.wrapping_sub(self.linear_base) < FCRAM_SIZE_NEW3DS || (VRAM_VADDR..VRAM_VADDR + VRAM_SIZE).contains(&vaddr)
+    }
+
+    /// tells the GPU's journal physical memory was written, a service or
+    /// the kernel writing what the GPU may read.
+    fn note_physical(&self, paddr: u32, len: u32) {
+        if paddr >= FCRAM_PADDR {
+            zakuro_gpu::journal::note(self.linear_base.wrapping_add(paddr - FCRAM_PADDR), len);
+        } else if (VRAM_PADDR..VRAM_PADDR + VRAM_SIZE).contains(&paddr) {
+            zakuro_gpu::journal::note(VRAM_VADDR + (paddr - VRAM_PADDR), len);
         }
     }
 
     /// where the guest's address 0 is in the host's view of all of it, null
     /// without one.
     pub fn fastmem(&self) -> *mut u8 {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let (Some(view), true) = (&self.view, self.phys.backing(FCRAM_PADDR, PAGE_SIZE).is_some()) {
             return view.base();
         }
@@ -148,7 +174,7 @@ impl Memory {
             }
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(view) = &self.view {
             match self.phys.backing(paddr, size) {
                 Some((fd, offset)) => {
@@ -198,7 +224,7 @@ impl Memory {
     }
 
     pub fn unmap(&mut self, vaddr: VAddr, size: u32) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(view) = &self.view {
             view.unmap(vaddr, size);
         }
@@ -342,6 +368,9 @@ impl Memory {
 
     /// write_bytes without noting faults, false when a page was unmapped.
     pub fn write_bytes_quiet(&mut self, vaddr: VAddr, data: &[u8]) -> bool {
+        if self.gpu_reads(vaddr) {
+            zakuro_gpu::journal::note(vaddr, data.len() as u32);
+        }
         let mut mapped = true;
         let mut done = 0usize;
         while done < data.len() {
@@ -361,6 +390,7 @@ impl Memory {
     /// writes straight to physical memory, bypassing the page table and its
     /// permissions.
     pub fn write_physical(&mut self, paddr: u32, data: &[u8]) -> bool {
+        self.note_physical(paddr, data.len() as u32);
         match self.phys.host_slice_mut(paddr, data.len() as u32) {
             Some(slice) => {
                 slice.copy_from_slice(data);
@@ -376,8 +406,23 @@ impl Memory {
         }
     }
 
+    /// reads straight from physical memory, zeroes where nothing backs it.
+    pub fn read_physical(&mut self, paddr: u32, out: &mut [u8]) -> bool {
+        match self.phys.host_slice_mut(paddr, out.len() as u32) {
+            Some(slice) => {
+                out.copy_from_slice(slice);
+                true
+            }
+            None => {
+                out.fill(0);
+                false
+            }
+        }
+    }
+
     /// zeroes a physical range, for BSS and freshly allocated pages.
     pub fn zero_physical(&mut self, paddr: u32, size: u32) -> bool {
+        self.note_physical(paddr, size);
         match self.phys.host_slice_mut(paddr, size) {
             Some(slice) => {
                 slice.fill(0);

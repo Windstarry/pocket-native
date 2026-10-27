@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::font::{rgba, Canvas};
 use crate::input::{A, B, DOWN, LEFT, RIGHT, UP};
 use crate::profile::Profile;
-use crate::settings::{Advanced, Buttons, GameSettings, Layout, Power, Settings, Speed, Stick};
+use crate::settings::{Advanced, Aspect, Buttons, Dpad, GameSettings, Layout, Power, RightStick, Rotation, Settings, Speed, Stick, Stretch};
 
 const PANEL: [u8; 3] = [13, 20, 32];
 const EDGE: [u8; 3] = [40, 110, 210];
@@ -24,18 +24,26 @@ const ROW: f32 = 19.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Layout,
+    Aspect,
+    Resolution,
     Smooth,
+    Stretch,
     Interpolate,
     ShowFps,
     ShowClock,
+    Rotation,
     FrameCap,
     Power,
     Option(usize),
     TouchSpeed,
     Buttons,
     LeftStick,
+    Dpad,
+    RightStick,
     ReverseTiltX,
     ReverseTiltY,
+    TouchControls,
+    EditControls,
     Resume,
     Advanced,
     Reset,
@@ -86,7 +94,7 @@ const TOGGLES: [(&str, fn(&mut Advanced) -> &mut bool, [&str; 2], &str); 31] = [
     ("ROM read-ahead", |a| &mut a.read_ahead, ON_OFF, "Reads the parts of the game it loaded last time ahead. Try Off if loading stalls."),
     ("Shader compiling", |a| &mut a.background_shaders, ["When needed", "Background"], "Background builds new shaders with no pause, a stand-in drawn meanwhile. Try When needed for brief glitches."),
     ("Skip the right eye", |a| &mut a.skip_right_eye, ON_OFF, "Leaves out the right eye's picture, which 2D never shows. Try Off if the top screen flickers or is wrong."),
-    ("Draw only shown frames", |a| &mut a.shown_only, ON_OFF, "Leaves out the frames the frame cap never shows. Eases the GPU in games that draw every frame. Try Off if it stutters."),
+    ("Draw only shown frames", |a| &mut a.shown_only, ON_OFF, "Leaves out the frames the frame cap never shows, easing the GPU. Try Off if it stutters."),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,7 +107,7 @@ enum Page {
 impl Field {
     /// picked with A rather than changed with left and right.
     fn action(self) -> bool {
-        matches!(self, Field::Resume | Field::Advanced | Field::Reset | Field::Quit | Field::Restart | Field::Compatible | Field::Defaults | Field::Back)
+        matches!(self, Field::Resume | Field::Advanced | Field::Reset | Field::Quit | Field::Restart | Field::Compatible | Field::Defaults | Field::Back | Field::EditControls)
     }
 }
 
@@ -111,18 +119,22 @@ pub enum Action {
     Resume,
     Reset,
     Quit,
+    /// the touch controls to move and size.
+    EditControls,
 }
 
 /// the layouts the menu goes through, with the screens swapped or not.
-const LAYOUTS: [(Layout, bool, &str); 6] = [
+const LAYOUTS: [(Layout, bool, &str); 7] = [
     (Layout::BigTop, false, "Big top"),
     (Layout::BigTop, true, "Swapped"),
     (Layout::TopOnly, false, "Top only"),
     (Layout::TopOnly, true, "Bottom only"),
     (Layout::SideBySide, false, "Side by side"),
+    (Layout::BigBeside, false, "Big top, small beside"),
     (Layout::Original, false, "Original size"),
 ];
 const CAPS: [u32; 3] = [20, 30, 60];
+const RESOLUTIONS: [f32; 11] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5];
 /// the languages and regions in cfg's order.
 const LANGUAGES: [&str; 12] = ["Japanese", "English", "French", "German", "Italian", "Spanish", "Chinese (simplified)", "Korean", "Dutch", "Portuguese", "Russian", "Chinese (traditional)"];
 const REGIONS: [&str; 7] = ["Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"];
@@ -138,20 +150,36 @@ pub struct Menu {
     held: u32,
 }
 
+/// whether a field does anything on this handheld: touch controls where a
+/// program around the frontend gives touches, an Android app's; filling the
+/// displays with a screen on each; turning a panel the frontend drives
+/// itself, which an Android window does on its own; and power where the
+/// launcher gives a program for it.
+fn useful(field: Field) -> bool {
+    match field {
+        Field::TouchControls | Field::EditControls => crate::input::shared().is_some(),
+        Field::Stretch => zakuro_gpu::second_window() || zakuro_gpu::stacked(),
+        Field::Rotation => crate::input::shared().is_none(),
+        Field::Power => std::env::var_os("POCKET_NATIVE_POWER").is_some(),
+        _ => true,
+    }
+}
+
 fn sections(page: Page, profile: &Profile) -> Vec<(&'static str, Vec<Field>)> {
     let toggles = |range: std::ops::RangeInclusive<usize>| range.map(Field::Toggle).collect();
+    let only = |fields: Vec<Field>| fields.into_iter().filter(|&field| useful(field)).collect();
     match page {
         Page::Main => vec![
-            ("Display", vec![Field::Layout, Field::Smooth, Field::Interpolate, Field::ShowFps, Field::ShowClock]),
-            ("Performance", vec![Field::FrameCap, Field::Power]),
+            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::Rotation])),
+            ("Performance", only(vec![Field::FrameCap, Field::Power])),
             ("This game", (0..profile.options.len()).map(Field::Option).collect()),
-            ("Controls", vec![Field::TouchSpeed, Field::Buttons, Field::LeftStick, Field::ReverseTiltX, Field::ReverseTiltY]),
+            ("Controls", only(vec![Field::TouchSpeed, Field::Buttons, Field::LeftStick, Field::Dpad, Field::RightStick, Field::ReverseTiltX, Field::ReverseTiltY, Field::TouchControls, Field::EditControls])),
             ("Game", vec![Field::Resume, Field::Advanced, Field::Reset, Field::Quit]),
         ],
         Page::Advanced => vec![
-            ("Applies at once", vec![Field::Toggle(0), Field::Toggle(28), Field::FrameSkip]),
+            ("Applies at once", vec![Field::Toggle(0), Field::Toggle(29), Field::Toggle(30), Field::FrameSkip]),
             ("Speed hacks - requires restart", toggles(1..=11)),
-            ("Graphics - requires restart", toggles(12..=22)),
+            ("Graphics - requires restart", [toggles(12..=22), vec![Field::Toggle(28)]].concat()),
             ("CPU - requires restart", toggles(23..=24)),
             ("Loading - requires restart", toggles(25..=27)),
             ("System - requires restart", vec![Field::Language, Field::Region]),
@@ -175,10 +203,42 @@ fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profi
             };
             ("Layout", value)
         }
+        Field::Aspect => (
+            "Aspect ratio",
+            match settings.aspect {
+                Aspect::Original => "Original",
+                Aspect::Integer => "Integer scale",
+                Aspect::FourThree => "4:3",
+                Aspect::SixteenTen => "16:10",
+                Aspect::SixteenNine => "16:9",
+                Aspect::Stretch => "Stretch",
+            }
+            .into(),
+        ),
+        Field::Resolution => ("Resolution", if settings.resolution == 1.0 { "Native".into() } else { format!("{}x", settings.resolution) }),
         Field::Smooth => ("Smooth scaling", if settings.smooth { "On" } else { "Off" }.into()),
+        Field::Stretch => (
+            "Fill the display",
+            match settings.stretched {
+                Stretch::Off => "Off",
+                Stretch::Top => "Top screen",
+                Stretch::Bottom => "Bottom screen",
+                Stretch::Both => "Both",
+            }
+            .into(),
+        ),
         Field::Interpolate => ("Frame interpolation", if settings.interpolate_to == 0 { "Off".into() } else { format!("Up to {} fps", settings.interpolate_to) }),
         Field::ShowFps => ("Show fps", if settings.show_fps { "On" } else { "Off" }.into()),
         Field::ShowClock => ("Clock and battery", if settings.show_clock { "On" } else { "Off" }.into()),
+        Field::Rotation => {
+            let rotation = match settings.rotation {
+                Rotation::Auto => "Auto",
+                Rotation::Clockwise => "Clockwise",
+                Rotation::CounterClockwise => "Counter clockwise",
+                Rotation::Off => "Off",
+            };
+            ("Rotation", rotation.into())
+        }
         Field::FrameCap => ("Frame cap", format!("{} fps", settings.frame_cap)),
         Field::Power => ("Power", format!("{:?}", settings.power)),
         Field::Option(index) => {
@@ -189,8 +249,19 @@ fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profi
         Field::TouchSpeed => ("Touch cursor speed", format!("{:?}", settings.touch_speed)),
         Field::Buttons => ("A/B layout", format!("{:?}", settings.buttons)),
         Field::LeftStick => ("Left stick", if settings.left_stick == Stick::CirclePad { "Circle pad" } else { "D-pad" }.into()),
+        Field::Dpad => {
+            let dpad = match settings.dpad {
+                Dpad::Dpad => "D-pad",
+                Dpad::CirclePad => "Circle pad",
+                Dpad::Touch => "Touch cursor",
+            };
+            ("D-pad", dpad.into())
+        }
+        Field::RightStick => ("Right stick", if settings.right_stick == RightStick::CStick { "C-stick" } else { "Touch cursor" }.into()),
         Field::ReverseTiltX => ("Reverse tilt X", if settings.reverse_tilt_x { "On" } else { "Off" }.into()),
         Field::ReverseTiltY => ("Reverse tilt Y", if settings.reverse_tilt_y { "On" } else { "Off" }.into()),
+        Field::TouchControls => ("Touch controls", if settings.touch_controls { "On" } else { "Off" }.into()),
+        Field::EditControls => ("Edit touch controls", "→".into()),
         Field::Resume => ("Resume", String::new()),
         Field::Advanced => ("Advanced settings", "→".into()),
         Field::Reset => ("Reset", String::new()),
@@ -222,10 +293,17 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
             let (layout, swapped, _) = LAYOUTS[(at + by).rem_euclid(LAYOUTS.len() as isize) as usize];
             (settings.layout, settings.swapped) = (layout, swapped);
         }
+        Field::Aspect => settings.aspect = step(&Aspect::ALL, settings.aspect, by),
+        Field::Resolution => settings.resolution = step(&RESOLUTIONS, settings.resolution, by),
         Field::Smooth => settings.smooth = !settings.smooth,
+        Field::Stretch => {
+            let at = Stretch::ALL.iter().position(|&stretch| stretch == settings.stretched).unwrap_or(0) as isize;
+            settings.stretched = Stretch::ALL[(at + by).rem_euclid(Stretch::ALL.len() as isize) as usize];
+        }
         Field::Interpolate => settings.interpolate_to = step(&[0, 30, 60], settings.interpolate_to, by),
         Field::ShowFps => settings.show_fps = !settings.show_fps,
         Field::ShowClock => settings.show_clock = !settings.show_clock,
+        Field::Rotation => settings.rotation = step(&[Rotation::Auto, Rotation::Clockwise, Rotation::CounterClockwise, Rotation::Off], settings.rotation, by),
         Field::FrameCap => settings.frame_cap = step(&CAPS, settings.frame_cap, by),
         Field::Power => settings.power = step(&[Power::Saver, Power::Balanced, Power::Performance], settings.power, by),
         Field::Option(index) => {
@@ -236,8 +314,11 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
         Field::TouchSpeed => settings.touch_speed = step(&[Speed::Slow, Speed::Normal, Speed::Fast], settings.touch_speed, by),
         Field::Buttons => settings.buttons = step(&[Buttons::Nintendo, Buttons::Xbox], settings.buttons, by),
         Field::LeftStick => settings.left_stick = step(&[Stick::CirclePad, Stick::Dpad], settings.left_stick, by),
+        Field::Dpad => settings.dpad = step(&[Dpad::Dpad, Dpad::CirclePad, Dpad::Touch], settings.dpad, by),
+        Field::RightStick => settings.right_stick = step(&[RightStick::Cursor, RightStick::CStick], settings.right_stick, by),
         Field::ReverseTiltX => settings.reverse_tilt_x = !settings.reverse_tilt_x,
         Field::ReverseTiltY => settings.reverse_tilt_y = !settings.reverse_tilt_y,
+        Field::TouchControls => settings.touch_controls = !settings.touch_controls,
         Field::Toggle(index) => {
             let mut advanced = Advanced::of(game, profile);
             let setting = (TOGGLES[index].1)(&mut advanced);
@@ -253,30 +334,38 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
         Field::Region => game.region = (game.region as isize + by).rem_euclid(REGIONS.len() as isize) as u8,
         Field::Compatible => game.advanced = Some(Advanced::compatible(Advanced::of(game, profile))),
         Field::Defaults => game.advanced = None,
-        Field::Resume | Field::Advanced | Field::Reset | Field::Quit | Field::Restart | Field::Back => {}
+        Field::Resume | Field::Advanced | Field::Reset | Field::Quit | Field::Restart | Field::Back | Field::EditControls => {}
     }
 }
 
 /// what the help under the list says about a field.
 fn help(field: Field, profile: &Profile) -> &str {
     match field {
-        Field::Layout => "Where the screens go. A tap of L2 swaps them, FN and R1 switch to one big screen.",
+        Field::Layout => "Where the screens go. A tap of L2 swaps them, FN or L3 with R1 switch to one big screen.",
+        Field::Aspect => "The screens' shape: as on the 3DS, scaled by whole pixels, the top one 4:3, 16:10 or 16:9, or both stretched to fill.",
+        Field::Resolution => "How sharp the 3D is drawn, times the 3DS's own. Higher takes more GPU. Restart the game for it.",
         Field::Smooth => "Smooths the picture as it is scaled up. Off is sharper, with uneven pixels.",
+        Field::Stretch => "With a screen on each display, the screens stretched over theirs: no bars, but out of shape.",
         Field::Interpolate => "Fills in pictures halfway between a game's, up to 30 or 60 a second. 30 costs half as much GPU time.",
         Field::ShowFps => "Pictures a second and the temperature, in the bottom right corner.",
         Field::ShowClock => "The battery and a 12-hour clock, in the bottom left corner.",
+        Field::Rotation => "Turns the picture for a screen that shows it the wrong way round. Takes effect when the game starts again.",
         Field::FrameCap => "The most pictures shown a second. Lower lasts longer and runs cooler.",
         Field::Power => "How fast the CPU and GPU run. Performance is fastest and warmest, Saver lasts longest.",
         Field::Option(index) => &profile.options[index].help,
         Field::TouchSpeed => "How fast the right stick moves the touch cursor. R2 or R3 touches.",
         Field::Buttons => "Which face buttons are A and B: where Nintendo puts them, or where Xbox does.",
         Field::LeftStick => "The left stick as the circle pad, or as the d-pad.",
+        Field::Dpad => "The d-pad as itself, the circle pad or the touch cursor. FN or L3 with Select switches it in game.",
+        Field::RightStick => "The touch cursor, or the C-stick with L2 and R2 as ZL and ZR for New 3DS games. R3 switches it in game.",
         Field::ReverseTiltX => "Holding L2, the right stick tilts the console. On tilts it the other way left and right.",
         Field::ReverseTiltY => "Holding L2, the right stick tilts the console. On tilts it the other way up and down.",
+        Field::TouchControls => "Buttons and a circle pad on the touch screen. They hide while a gamepad is used.",
+        Field::EditControls => "Move and size the touch controls, for the way the screen is held now. Done or FN to finish.",
         Field::Resume => "Back to the game. B or FN does the same.",
         Field::Advanced => "This game's switches for speed and for games that do not run right, each with a hint.",
         Field::Reset => "Starts the game again from the beginning.",
-        Field::Quit => "Back to EmulationStation.",
+        Field::Quit => if cfg!(target_os = "android") { "Back to the game list." } else { "Back to EmulationStation." },
         Field::Toggle(index) => TOGGLES[index].3,
         Field::FrameSkip => "The most pictures left out in a row while the game is behind. Off is smoother and slower.",
         Field::Language => "The console language the game is told. Games without it pick one of their own.",
@@ -374,6 +463,10 @@ impl Menu {
                 Action::Redraw
             }
             Field::Back => self.back(profile),
+            Field::EditControls => {
+                self.open = false;
+                Action::EditControls
+            }
             Field::Reset | Field::Quit | Field::Restart if self.confirm != Some(self.cursor) => {
                 self.confirm = Some(self.cursor);
                 Action::Redraw
@@ -489,27 +582,35 @@ pub struct Status {
     fps: Option<String>,
     battery: Option<i64>,
     clock: Option<String>,
+    /// what a hotkey just did, at the top.
+    pub note: Option<&'static str>,
 }
 
 impl Status {
     /// none when the settings show nothing.
-    pub fn now(settings: &Settings, fps: u32) -> Option<Status> {
+    pub fn now(settings: &Settings, fps: u32, note: Option<&'static str>) -> Option<Status> {
         let read = |path: &str| std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse::<i64>().ok());
         let status = Status {
             fps: settings.show_fps.then(|| match read("/sys/class/thermal/thermal_zone0/temp") {
                 Some(milli) => format!("{fps} fps · {}°C", milli / 1000),
                 None => format!("{fps} fps"),
             }),
-            battery: settings.show_clock.then(|| read("/sys/class/power_supply/battery/capacity")).flatten(),
+            battery: settings.show_clock.then(battery).flatten(),
             clock: settings.show_clock.then(clock),
+            note,
         };
-        (status.fps.is_some() || status.clock.is_some()).then_some(status)
+        (status.fps.is_some() || status.clock.is_some() || note.is_some()).then_some(status)
     }
 
     pub fn draw(&self, canvas: &mut Canvas, (width, height): (u32, u32)) {
         let (width, height) = (width as f32, height as f32);
         let (top, bottom) = (height - 32.0, height - 8.0);
         let backing = rgba([0, 0, 0], 160);
+        if let Some(note) = self.note {
+            let half = canvas.measure(BIG, note) / 2.0 + 6.0;
+            canvas.fill([width / 2.0 - half, 8.0, width / 2.0 + half, 32.0], backing);
+            canvas.text(BIG, note, width / 2.0 - half + 6.0, 11.0, rgba(TEXT, 255), false);
+        }
         if let Some(line) = &self.fps {
             canvas.fill([width - 20.0 - canvas.measure(BIG, line), top, width - 8.0, bottom], backing);
             canvas.text(BIG, line, width - 14.0, top + 3.0, rgba(TEXT, 255), true);
@@ -535,6 +636,18 @@ impl Status {
         }
         canvas.text(BIG, &text, x, top + 3.0, rgba(TEXT, 255), false);
     }
+}
+
+/// the battery's percentage, from whichever power supply is the battery:
+/// battery on the R36S, named another way on others, Knulli's among them.
+fn battery() -> Option<i64> {
+    static CAPACITY: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let capacity = CAPACITY.get_or_init(|| {
+        let supplies = std::fs::read_dir("/sys/class/power_supply").ok()?;
+        let battery = supplies.flatten().map(|supply| supply.path()).find(|supply| std::fs::read_to_string(supply.join("type")).is_ok_and(|kind| kind.trim() == "Battery"))?;
+        Some(battery.join("capacity"))
+    });
+    std::fs::read_to_string(capacity.as_ref()?).ok()?.trim().parse().ok()
 }
 
 fn clock() -> String {
@@ -568,6 +681,17 @@ mod tests {
             })
             .collect();
         assert!(long.is_empty(), "{long:#?}");
+    }
+
+    /// every toggle is on the advanced page, once: one added to TOGGLES
+    /// needs a place in a section.
+    #[test]
+    fn every_toggle_has_its_place() {
+        let fields: Vec<Field> = sections(Page::Advanced, &Profile::default()).into_iter().flat_map(|(_, fields)| fields).collect();
+        for index in 0..TOGGLES.len() {
+            let count = fields.iter().filter(|&&field| field == Field::Toggle(index)).count();
+            assert_eq!(count, 1, "{} is in the advanced settings {count} times", TOGGLES[index].0);
+        }
     }
 
     #[test]

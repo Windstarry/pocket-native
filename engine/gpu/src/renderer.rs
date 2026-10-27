@@ -13,16 +13,6 @@ pub trait Renderer {
     /// executes a draw with the current register state.
     fn draw(&mut self, call: DrawCall<'_>);
 
-    /// one word of vertex shader program upload.
-    fn upload_shader_code(&mut self, word: u32) {
-        let _ = word;
-    }
-
-    /// one word of vertex shader operand descriptor upload.
-    fn upload_shader_operand_descriptor(&mut self, word: u32) {
-        let _ = word;
-    }
-
     /// called once per emulated frame, after both screens have been
     /// transferred, so a deferred backend can flush.
     fn end_frame(&mut self) {}

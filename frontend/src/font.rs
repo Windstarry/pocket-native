@@ -7,9 +7,12 @@ use std::sync::Arc;
 use zakuro_gpu::{Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
 
 const FONT: &[u8] = include_bytes!("../../assets/fonts/menu.font");
-/// the overlay's textures: one white texel for the boxes, then the atlas.
+/// the overlay's textures: one white texel for the boxes, the atlas, and a
+/// white disc for round buttons.
 const WHITE: u64 = 1;
 const ATLAS: u64 = 2;
+const DISC: u64 = 3;
+const DISC_SIZE: u32 = 64;
 
 #[derive(Clone, Copy)]
 struct Glyph {
@@ -32,6 +35,8 @@ pub struct Font {
     size: [u32; 2],
     /// the atlas as premultiplied white.
     pixels: Arc<Vec<u8>>,
+    /// the disc as premultiplied white, its edge smoothed.
+    disc: Arc<Vec<u8>>,
 }
 
 fn read<const N: usize>(data: &[u8], at: &mut usize) -> [u8; N] {
@@ -62,7 +67,14 @@ impl Font {
             faces.push(Face { glyphs: table, ascent: ascent as f32 });
         }
         let pixels = FONT[at..at + width as usize * height as usize].iter().flat_map(|&alpha| [alpha; 4]).collect();
-        Font { faces, size: [width as u32, height as u32], pixels: Arc::new(pixels) }
+        let middle = DISC_SIZE as f32 / 2.0;
+        let disc = (0..DISC_SIZE * DISC_SIZE)
+            .flat_map(|at| {
+                let (x, y) = ((at % DISC_SIZE) as f32 + 0.5 - middle, (at / DISC_SIZE) as f32 + 0.5 - middle);
+                [((middle - x.hypot(y)).clamp(0.0, 1.0) * 255.0) as u8; 4]
+            })
+            .collect();
+        Font { faces, size: [width as u32, height as u32], pixels: Arc::new(pixels), disc: Arc::new(disc) }
     }
 }
 
@@ -76,6 +88,7 @@ impl Face {
 pub struct Canvas<'a> {
     font: &'a Font,
     boxes: OverlayMesh,
+    discs: OverlayMesh,
     text: OverlayMesh,
 }
 
@@ -96,11 +109,19 @@ pub fn rgba([r, g, b]: [u8; 3], alpha: u8) -> [u8; 4] {
 impl<'a> Canvas<'a> {
     pub fn new(font: &'a Font, (width, height): (u32, u32)) -> Canvas<'a> {
         let mesh = |texture| OverlayMesh { texture, clip: [0, 0, width, height], vertices: Vec::new(), indices: Vec::new() };
-        Canvas { font, boxes: mesh(WHITE), text: mesh(ATLAS) }
+        Canvas { font, boxes: mesh(WHITE), discs: mesh(DISC), text: mesh(ATLAS) }
     }
 
     pub fn measure(&self, face: usize, text: &str) -> f32 {
         self.font.faces[face].width(text)
+    }
+
+    pub fn ascent(&self, face: usize) -> f32 {
+        self.font.faces[face].ascent
+    }
+
+    pub fn disc(&mut self, [x, y]: [f32; 2], radius: f32, color: [u8; 4]) {
+        quad(&mut self.discs, [x - radius, y - radius, x + radius, y + radius], [0.0, 0.0, 1.0, 1.0], color);
     }
 
     pub fn fill(&mut self, area: [f32; 4], color: [u8; 4]) {
@@ -138,7 +159,8 @@ impl<'a> Canvas<'a> {
         let textures = vec![
             OverlayTexture { id: WHITE, offset: None, size: [1, 1], pixels: vec![255; 4], linear: false },
             OverlayTexture { id: ATLAS, offset: None, size: self.font.size, pixels: self.font.pixels.to_vec(), linear: false },
+            OverlayTexture { id: DISC, offset: None, size: [DISC_SIZE; 2], pixels: self.font.disc.to_vec(), linear: true },
         ];
-        Overlay { textures, meshes: vec![self.boxes, self.text], free: Vec::new() }
+        Overlay { textures, meshes: vec![self.boxes, self.discs, self.text], free: Vec::new(), whole: false }
     }
 }

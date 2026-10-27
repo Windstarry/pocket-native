@@ -9,6 +9,9 @@ pub struct Overlay {
     pub meshes: Vec<OverlayMesh>,
     /// textures that go away once this frame is drawn.
     pub free: Vec<u64>,
+    /// in the layout's size, over all of it, rather than in the menu's
+    /// 640x480 in the middle.
+    pub whole: bool,
 }
 
 /// pixels for a texture of the overlay.

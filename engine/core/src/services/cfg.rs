@@ -11,6 +11,13 @@ pub const REGION_EUROPE: u8 = 2;
 /// language codes.
 pub const LANGUAGE_ENGLISH: u8 = 1;
 
+/// what GenHashConsoleUnique answers for every salt, this console's hash.
+pub const CONSOLE_HASH: u64 = 0x0000_5255_3341_5A55;
+
+/// the user agreement version the console accepted, minor then major,
+/// the highest there is, so a game finds any version it knows accepted.
+pub const EULA_VERSION: [u8; 2] = [0x7F, 0x7F];
+
 pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
     match header.command_id() {
         // GetConfigInfoBlk2(size, block id) with the result written to a
@@ -30,7 +37,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         // GenHashConsoleUnique(salt) -> a 64-bit hash.
         0x0003 => {
-            buffer.reply(&mut system.memory, 0x0003, &[0x3341_5A55, 0x0000_5255]);
+            buffer.reply(&mut system.memory, 0x0003, &[CONSOLE_HASH as u32, (CONSOLE_HASH >> 32) as u32]);
             true
         }
         // GetRegionCanadaUSA
@@ -102,8 +109,7 @@ fn write_config_block(system: &mut System, block_id: u32, out: u32, size: u32) {
         // EULA version.
         0x000D_0000 => {
             if data.len() >= 2 {
-                data[0] = 1;
-                data[1] = 1;
+                data[..2].copy_from_slice(&EULA_VERSION);
             }
         }
         // parental controls, disabled.

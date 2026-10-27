@@ -16,6 +16,8 @@ fn main() {
     let frames: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(60);
 
     let config = Config {
+        // ZAKURO_NEW3DS=1 runs the title on a New 3DS.
+        new3ds: std::env::var("ZAKURO_NEW3DS").is_ok_and(|v| v == "1"),
         language: std::env::var("ZAKURO_LANGUAGE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -24,8 +26,9 @@ fn main() {
         recompiled: std::env::var("ZAKURO_RECOMPILED").ok().map(Into::into),
         // ZAKURO_RASTERIZER=hardware draws on the host GPU.
         hardware_renderer: std::env::var("ZAKURO_RASTERIZER").is_ok_and(|v| v == "hardware"),
-        // ZAKURO_RESOLUTION=3 draws at three times the console's resolution.
-        resolution: std::env::var("ZAKURO_RESOLUTION").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+        // ZAKURO_RESOLUTION=3 draws at three times the console's resolution,
+        // in quarters, 1.5 too.
+        resolution: std::env::var("ZAKURO_RESOLUTION").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
         // ZAKURO_CLOCK=milliseconds since 1900 starts the clock there, so that
         // runs repeat exactly.
         clock: std::env::var("ZAKURO_CLOCK").ok().and_then(|v| v.parse().ok()),

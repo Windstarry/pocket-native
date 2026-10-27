@@ -1,0 +1,8 @@
+name = "Pokémon Moon"
+
+[[option]]
+name = "Bottom screen in battle"
+help = "How often the battle menu is drawn. 15 fps leaves more time for the battle."
+values = ["15 fps", "30 fps"]
+default = false
+bottom_full_rate_when_on = true

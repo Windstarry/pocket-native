@@ -31,9 +31,12 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         MemoryType::Base => memory::MemoryRegion::Base,
     };
 
-    // a title marked New3DS-only has to run as one.
+    // a title marked New3DS-only has to run as one, and a New 3DS is one
+    // all the way through
     if title.ncch.platform() == 2 {
         config.new3ds = true;
+    }
+    if config.new3ds {
         config.model = ConsoleModel::New3ds;
     }
 

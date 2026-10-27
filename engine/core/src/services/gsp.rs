@@ -179,8 +179,14 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
-        // the cache maintenance commands, memory is coherent for us.
+        // the cache maintenance commands. memory is coherent for us, but a
+        // flush says the title's CPU wrote there, which the GPU may have
+        // read before
         FLUSH_DATA_CACHE | INVALIDATE_DATA_CACHE | STORE_DATA_CACHE => {
+            if id != INVALIDATE_DATA_CACHE {
+                let (address, size) = (buffer.get(&mut system.memory, 1), buffer.get(&mut system.memory, 2));
+                zakuro_gpu::journal::note(address, size);
+            }
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -259,7 +265,14 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         REGISTER_INTERRUPT_RELAY_QUEUE => {
             let event = buffer.get(&mut system.memory, 3);
             system.services.gsp.interrupt_event = Some(event);
-            system.services.gsp.interrupt_event_object = system.kernel.resolve(event);
+            // kept while registered, whatever the title does with its handle
+            let object = system.kernel.resolve(event);
+            if let Some(object) = object {
+                system.kernel.objects.add_ref(object);
+            }
+            if let Some(old) = std::mem::replace(&mut system.services.gsp.interrupt_event_object, object) {
+                system.kernel.objects.release(old);
+            }
 
             let handle = ensure_shared_memory(system);
             let index = system.services.gsp.thread_index;
@@ -275,7 +288,9 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
         }
         UNREGISTER_INTERRUPT_RELAY_QUEUE => {
             system.services.gsp.interrupt_event = None;
-            system.services.gsp.interrupt_event_object = None;
+            if let Some(old) = system.services.gsp.interrupt_event_object.take() {
+                system.kernel.objects.release(old);
+            }
             buffer.reply(&mut system.memory, id, &[]);
             true
         }
@@ -514,8 +529,12 @@ fn execute_command(system: &mut System, command: GxCommand) {
                 command.data[4],
             );
         }
-        // CacheFlush
-        0x05 => {}
+        // CacheFlush, up to three ranges the title's CPU wrote
+        0x05 => {
+            for range in command.data[..6].chunks(2) {
+                zakuro_gpu::journal::note(range[0], range[1]);
+            }
+        }
         other => log::warn!("unknown GX command 0x{other:02X}"),
     }
 }

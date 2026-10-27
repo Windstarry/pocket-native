@@ -14,6 +14,13 @@ This fork started from the repository that put the two together,
 [WINDROID-EMU/3dsrecomp](https://github.com/WINDROID-EMU/3dsrecomp), by
 **genrogamer**.
 
+## Android
+
+The Android port started from **gopnikcosmoslav2077**'s work in
+[#8](https://github.com/whovian64/pocket-native/pull/8): the renderer drawing
+into an Android window and onto a second display, touch, AAudio sound and the
+first APK build.
+
 ## Menu font
 
 The menu uses [M PLUS Rounded 1c](https://fonts.google.com/specimen/M+PLUS+Rounded+1c),

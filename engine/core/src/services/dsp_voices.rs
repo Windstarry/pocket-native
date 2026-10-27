@@ -15,14 +15,22 @@ const STATUS_SIZE: u32 = 12;
 const COEFFICIENTS_SIZE: u32 = 32;
 /// region 1 of the shared memory starts this many bytes after region 0.
 pub const REGION_STRIDE: u32 = 0x2_0000;
-/// the longest embedded buffer taken at face value, some titles give the
-/// embedded buffer a nonsensical length.
-const MAX_EMBEDDED_LENGTH: u32 = 44_100;
 
 /// one frame of stereo samples.
 pub type Frame = [[i16; 2]; FRAME_SAMPLES];
 /// one frame of an intermediate mix, two left and two right channels.
 pub type QuadFrame = [[i32; 4]; FRAME_SAMPLES];
+
+/// how far through a frame each sample is, for a gain fading over it.
+const RAMP: [f32; FRAME_SAMPLES] = {
+    let mut ramp = [0.0; FRAME_SAMPLES];
+    let mut i = 0;
+    while i < FRAME_SAMPLES {
+        ramp[i] = i as f32 / (FRAME_SAMPLES - 1) as f32;
+        i += 1;
+    }
+    ramp
+};
 
 /// bits of a configuration's dirty word, which fields the title changed.
 mod dirty {
@@ -216,6 +224,10 @@ struct Voice {
     position: u32,
     /// what the voice played this frame.
     frame: Frame,
+    /// the buffer ran out on the frame's last sample, so the next one
+    /// waiting follows on from the next frame's first, as on the console,
+    /// rather than after a frame of silence.
+    ran_out_at_frame_end: bool,
 }
 
 impl Default for Voice {
@@ -243,6 +255,7 @@ impl Default for Voice {
             buffer_update: false,
             position: 0,
             frame: [[0; 2]; FRAME_SAMPLES],
+            ran_out_at_frame_end: false,
         }
     }
 }
@@ -311,14 +324,47 @@ impl Voice {
         [left, right]
     }
 
+    /// the playing buffer's input sample index from its bytes, read in one
+    /// go, as input reads it.
+    fn input_from(&self, data: &[u8], index: u32) -> [i16; 2] {
+        let Some(buffer) = &self.playing else { return [0; 2] };
+        let index = index.min(buffer.length.saturating_sub(1)) as usize;
+        let channels = if buffer.stereo { 2 } else { 1 };
+        match buffer.format {
+            Format::Adpcm => {
+                let sample = self.decoded.get(index).copied().unwrap_or(0);
+                [sample, sample]
+            }
+            Format::Pcm8 => {
+                let data = &data[index * channels..(index + 1) * channels];
+                [data[0] as i8 as i16 * 256, data[channels - 1] as i8 as i16 * 256]
+            }
+            Format::Pcm16 => {
+                let data = &data[index * channels * 2..(index + 1) * channels * 2];
+                [i16::from_le_bytes([data[0], data[1]]), i16::from_le_bytes([data[channels * 2 - 2], data[channels * 2 - 1]])]
+            }
+        }
+    }
+
+    /// the bytes of the buffer playing, how many it takes up.
+    fn playing_bytes(&self) -> Option<(u32, u32)> {
+        let buffer = self.playing.as_ref()?;
+        let width = match buffer.format {
+            Format::Adpcm => return Some((0, 0)),
+            Format::Pcm8 => 1,
+            Format::Pcm16 => 2,
+        };
+        Some((buffer.address & !3, buffer.length * width * if buffer.stereo { 2 } else { 1 }))
+    }
+
     /// the output sample at the current position, between two inputs.
-    fn sample(&self, memory: &mut impl SampleMemory) -> [i16; 2] {
+    fn sample(&self, mut input: impl FnMut(u32) -> [i16; 2]) -> [i16; 2] {
         let at = self.length - self.remaining;
-        let x0 = self.input(memory, at);
+        let x0 = input(at);
         if self.interpolation == Interpolation::None || self.fraction == 0 {
             return x0;
         }
-        let x1 = self.input(memory, at + 1);
+        let x1 = input(at + 1);
         let between = |a: i16, b: i16| (a as i64 + (((b as i64 - a as i64) * self.fraction as i64) >> 32)) as i16;
         [between(x0[0], x1[0]), between(x0[1], x1[1])]
     }
@@ -326,7 +372,8 @@ impl Voice {
     /// plays one audio frame's worth of input.
     fn play_frame(&mut self, memory: &mut impl SampleMemory) {
         self.frame = [[0; 2]; FRAME_SAMPLES];
-        if self.remaining == 0 {
+        let follows_on = std::mem::take(&mut self.ran_out_at_frame_end) && !self.queue.is_empty();
+        if self.remaining == 0 && !follows_on {
             if self.dequeue(memory) {
                 return;
             }
@@ -345,45 +392,95 @@ impl Voice {
         // each output sample consumes rate input samples, counted in 2^-32
         let step = (self.rate * 4_294_967_296.0) as u64;
         let mut output = 0;
+        let advance = |voice: &mut Voice| {
+            let input = voice.fraction as u64 + step;
+            let consumed = ((input >> 32) as u32).min(voice.remaining);
+            voice.fraction = (input - ((consumed as u64) << 32)).min(u32::MAX as u64) as u32;
+            voice.remaining -= consumed;
+        };
         while output < FRAME_SAMPLES {
             if self.remaining == 0 && !self.dequeue(memory) {
                 break;
             }
-            self.frame[output] = self.sample(memory);
-            output += 1;
-            let input = self.fraction as u64 + step;
-            let consumed = ((input >> 32) as u32).min(self.remaining);
-            self.fraction = (input - ((consumed as u64) << 32)).min(u32::MAX as u64) as u32;
-            self.remaining -= consumed;
+            // the buffer's bytes looked up once for the stretch of it this
+            // frame plays, a lookup for every sample cost more than mixing
+            let data = match self.playing_bytes() {
+                // ADPCM was decoded when the buffer came up
+                Some((_, 0)) if self.playing.is_some_and(|buffer| buffer.format == Format::Adpcm) => Some(&[][..]),
+                Some((address, length)) if length > 0 => memory.physical(address, length),
+                _ => None,
+            };
+            match data {
+                Some(data) => loop {
+                    self.frame[output] = self.sample(|index| self.input_from(data, index));
+                    output += 1;
+                    advance(self);
+                    if output == FRAME_SAMPLES || self.remaining == 0 {
+                        break;
+                    }
+                },
+                None => {
+                    self.frame[output] = self.sample(|index| self.input(memory, index));
+                    output += 1;
+                    advance(self);
+                }
+            }
         }
+        self.ran_out_at_frame_end = self.remaining == 0 && output == FRAME_SAMPLES;
         self.filters.process(&mut self.frame[..output]);
     }
 
-    /// adds what the voice played to one intermediate mix, fading from the
-    /// gains it had when they just changed.
-    fn mix_into(&mut self, mix: &mut QuadFrame, index: usize) {
-        let gains = self.gain[index];
-        let from = self.ramp[index].take();
-        // most voices reach only the first mix, the rest add nothing
-        if !self.enabled || (from.is_none() && gains == [0.0; 4]) {
-            return;
+    /// what mixing needs of what the voice played this frame, which takes
+    /// its gains' fades.
+    fn to_mix(&mut self) -> Option<VoiceMix> {
+        let from = [0, 1, 2].map(|index| self.ramp[index].take());
+        (self.enabled && (from.iter().any(Option::is_some) || self.gain.iter().any(|gains| *gains != [0.0; 4])))
+            .then(|| VoiceMix { frame: self.frame, gains: self.gain, from })
+    }
+}
+
+/// what one voice adds to the mixes in a frame, all that mixing needs, so
+/// it can happen on a thread of its own as the console's DSP does it.
+pub struct VoiceMix {
+    frame: Frame,
+    gains: [[f32; 4]; 3],
+    from: [Option<[f32; 4]>; 3],
+}
+
+/// the three intermediate mixes of what the voices played.
+pub fn mix(voices: &[VoiceMix]) -> [QuadFrame; 3] {
+    let mut mixes = [[[0; 4]; FRAME_SAMPLES]; 3];
+    for voice in voices {
+        for (index, mix) in mixes.iter_mut().enumerate() {
+            mix_frame(&voice.frame, voice.gains[index], voice.from[index], mix);
         }
-        let Some(from) = from else {
-            for (out, sample) in mix.iter_mut().zip(&self.frame) {
-                out[0] += (gains[0] * sample[0] as f32) as i32;
-                out[1] += (gains[1] * sample[1] as f32) as i32;
-                out[2] += (gains[2] * sample[0] as f32) as i32;
-                out[3] += (gains[3] * sample[1] as f32) as i32;
+    }
+    mixes
+}
+
+/// adds a frame to an intermediate mix at gains, fading to them from
+/// others when they just changed.
+fn mix_frame(frame: &Frame, gains: [f32; 4], from: Option<[f32; 4]>, mix: &mut QuadFrame) {
+    // most voices reach only the first mix, the rest add nothing
+    if from.is_none() && gains == [0.0; 4] {
+        return;
+    }
+    // the four channels side by side, which the compiler does at once
+    let quad = |sample: &[i16; 2]| [sample[0] as f32, sample[1] as f32, sample[0] as f32, sample[1] as f32];
+    let Some(from) = from else {
+        for (out, sample) in mix.iter_mut().zip(frame) {
+            let sample = quad(sample);
+            for c in 0..4 {
+                out[c] += (gains[c] * sample[c]) as i32;
             }
-            return;
-        };
-        for (i, (out, sample)) in mix.iter_mut().zip(&self.frame).enumerate() {
-            let progress = i as f32 / (FRAME_SAMPLES - 1) as f32;
-            let gain = |c: usize| from[c] + (gains[c] - from[c]) * progress;
-            out[0] += (gain(0) * sample[0] as f32) as i32;
-            out[1] += (gain(1) * sample[1] as f32) as i32;
-            out[2] += (gain(2) * sample[0] as f32) as i32;
-            out[3] += (gain(3) * sample[1] as f32) as i32;
+        }
+        return;
+    };
+    let span: [f32; 4] = std::array::from_fn(|c| gains[c] - from[c]);
+    for ((out, sample), progress) in mix.iter_mut().zip(frame).zip(RAMP) {
+        let sample = quad(sample);
+        for c in 0..4 {
+            out[c] += ((from[c] + span[c] * progress) * sample[c]) as i32;
         }
     }
 }
@@ -433,7 +530,7 @@ impl Default for Voices {
 impl Voices {
     /// one audio frame, take in what the title changed, play, report, and
     /// return the three intermediate mixes the voices made.
-    pub fn tick(&mut self, memory: &mut Memory, layout: Layout) -> [QuadFrame; 3] {
+    pub fn tick(&mut self, memory: &mut Memory, layout: Layout) -> Vec<VoiceMix> {
         let read = current_region(memory, layout);
         let write = 1 - read;
         if log::log_enabled!(log::Level::Trace) {
@@ -447,7 +544,7 @@ impl Voices {
         let coefficients = layout.coefficients + read * REGION_STRIDE;
         let statuses = layout.statuses + write * REGION_STRIDE;
 
-        let mut mixes = [[[0; 4]; FRAME_SAMPLES]; 3];
+        let mut mixing = Vec::with_capacity(self.voices.len());
         for (index, voice) in self.voices.iter_mut().enumerate() {
             let base = configurations + index as u32 * CONFIG_SIZE;
             let was_enabled = voice.enabled;
@@ -472,12 +569,10 @@ impl Voices {
             if voice.enabled {
                 voice.play_frame(memory);
             }
-            for (mix, frame) in mixes.iter_mut().enumerate() {
-                voice.mix_into(frame, mix);
-            }
+            mixing.extend(voice.to_mix());
             write_status(voice, memory, statuses + index as u32 * STATUS_SIZE);
         }
-        mixes
+        mixing
     }
 }
 
@@ -522,9 +617,11 @@ fn parse_config(voice: &mut Voice, memory: &mut Memory, base: u32, coefficients:
     }
     if flags & dirty::PARTIAL_RESET != 0 {
         voice.queue.clear();
+        voice.ran_out_at_frame_end = false;
     }
     if flags & dirty::ENABLE != 0 {
         voice.enabled = memory.read8(base + config::ENABLE) != 0;
+        voice.ran_out_at_frame_end = false;
     }
     if flags & dirty::SYNC_COUNT != 0 {
         voice.sync_count = memory.read16(base + config::SYNC_COUNT);
@@ -615,7 +712,7 @@ fn parse_config(voice: &mut Voice, memory: &mut Memory, base: u32, coefficients:
         let flags2 = memory.read16(base + config::FLAGS2);
         voice.queue.push(Buffer {
             address: read_dsp32(memory, base + config::ADDRESS),
-            length: read_dsp32(memory, base + config::LENGTH).min(MAX_EMBEDDED_LENGTH),
+            length: read_dsp32(memory, base + config::LENGTH),
             format: voice.format,
             stereo: voice.stereo,
             looping: flags2 & 0x2 != 0,
@@ -675,6 +772,33 @@ fn write_status(voice: &mut Voice, memory: &mut Memory, base: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mixing gives what it did before it was laid out four channels side
+    /// by side, steady and fading, sample for sample.
+    #[test]
+    fn mixing_matches_the_plain_loop() {
+        let reference = |frame: &Frame, from: Option<[f32; 4]>, gains: [f32; 4]| {
+            let mut mix = [[7; 4]; FRAME_SAMPLES];
+            for (i, (out, sample)) in mix.iter_mut().zip(frame).enumerate() {
+                let progress = i as f32 / (FRAME_SAMPLES - 1) as f32;
+                let gain = |c: usize| from.map_or(gains[c], |from| from[c] + (gains[c] - from[c]) * progress);
+                out[0] += (gain(0) * sample[0] as f32) as i32;
+                out[1] += (gain(1) * sample[1] as f32) as i32;
+                out[2] += (gain(2) * sample[0] as f32) as i32;
+                out[3] += (gain(3) * sample[1] as f32) as i32;
+            }
+            mix
+        };
+        let mut frame = [[0; 2]; FRAME_SAMPLES];
+        for (i, sample) in frame.iter_mut().enumerate() {
+            *sample = [(i as i32 * 977 % 65536 - 32768) as i16, (i as i32 * -613 % 32768) as i16];
+        }
+        for (from, gains) in [(None, [0.7, 1.3, 0.25, 0.0]), (Some([0.1, 0.9, 1.0, 0.33]), [0.8, 0.05, 0.6, 1.7])] {
+            let mut mix = [[7; 4]; FRAME_SAMPLES];
+            mix_frame(&frame, gains, from, &mut mix);
+            assert_eq!(mix, reference(&frame, from, gains));
+        }
+    }
 
     const BASE: u32 = 0x2000_0000;
 
@@ -738,6 +862,22 @@ mod tests {
         voice.play_frame(&mut memory); // finishes buffer 1
         voice.play_frame(&mut memory); // starts buffer 2 on the way
         assert_eq!(voice.current_buffer_id, 2);
+    }
+
+    /// a buffer that ends on a frame's last sample is followed by the next
+    /// with no silent frame between, a stream of them would stutter.
+    #[test]
+    fn queued_buffers_play_on_without_a_gap() {
+        let mut memory = Samples(1000i16.to_le_bytes().repeat(0x8000));
+        let mut voice = voice_with(&[(1, 320), (2, 320)]);
+        voice.play_frame(&mut memory); // starts buffer 1
+        for frame in 0..4 {
+            voice.play_frame(&mut memory);
+            assert!(voice.frame.iter().all(|s| s[0] == 1000), "frame {frame} has a gap");
+        }
+        assert_eq!((voice.current_buffer_id, voice.remaining), (2, 0));
+        voice.play_frame(&mut memory);
+        assert!(!voice.enabled, "and still switches off as soon as it runs out");
     }
 
     #[test]
@@ -811,18 +951,34 @@ mod tests {
         assert_eq!(history, [106, 106]);
     }
 
+    /// an embedded buffer plays as long as it says, a sound of a second or
+    /// two is common.
+    #[test]
+    fn an_embedded_buffer_keeps_its_length() {
+        use crate::memory::{MemoryState, Permission};
+        use zakuro_common::memory_map::{DSP_RAM_PADDR, DSP_RAM_SIZE, DSP_RAM_VADDR};
+        let mut system = crate::System::new(crate::Config::default());
+        let memory = &mut system.memory;
+        memory.map(DSP_RAM_VADDR, DSP_RAM_PADDR, DSP_RAM_SIZE, Permission::RW, MemoryState::Static);
+        let base = DSP_RAM_VADDR + 0x4_0000;
+        write_dsp32(memory, base + config::ADDRESS, 0x2000_0000);
+        write_dsp32(memory, base + config::LENGTH, 69_057);
+        memory.write32(base + config::DIRTY, dirty::EMBEDDED_BUFFER);
+        let mut voice = Voice::default();
+        parse_config(&mut voice, memory, base, base + 0x1000);
+        assert_eq!(voice.queue[0].length, 69_057);
+    }
+
     #[test]
     fn gains_fade_in_over_a_frame_once_changed() {
         let mut voice = Voice { enabled: true, ..Voice::default() };
         voice.frame = [[1000, 1000]; FRAME_SAMPLES];
         voice.ramp[0] = Some([0.0; 4]);
         voice.gain[0] = [1.0; 4];
-        let mut mix = [[0; 4]; FRAME_SAMPLES];
-        voice.mix_into(&mut mix, 0);
+        let [mix, ..] = mix(&[voice.to_mix().unwrap()]);
         assert_eq!(mix[0], [0; 4]);
         assert_eq!(mix[FRAME_SAMPLES - 1], [1000; 4]);
-        let mut again = [[0; 4]; FRAME_SAMPLES];
-        voice.mix_into(&mut again, 0);
+        let [again, ..] = super::mix(&[voice.to_mix().unwrap()]);
         assert_eq!(again[0], [1000; 4], "the fade happens once");
     }
 }

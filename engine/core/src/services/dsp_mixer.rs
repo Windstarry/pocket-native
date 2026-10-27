@@ -65,8 +65,29 @@ impl Mixer {
     /// mixes one frame from what the voices made, with read the region the
     /// title wrote last, and returns what the speakers play.
     pub fn tick(&mut self, memory: &mut Memory, layout: Layout, read: u32, mixes: [QuadFrame; 3]) -> Frame {
-        let write = 1 - read;
+        self.read_config(memory, layout, read);
+        self.finish(memory, layout, read, mixes)
+    }
+
+    /// reads the configuration the title wrote last, in region read.
+    pub fn read_config(&mut self, memory: &mut Memory, layout: Layout, read: u32) {
         self.parse_config(memory, layout.configuration + read * REGION_STRIDE);
+    }
+
+    /// whether the title processes mix 1 or 2 itself, which then passes
+    /// through its memory every frame.
+    pub fn uses_aux(&self) -> bool {
+        self.aux.contains(&true)
+    }
+
+    /// the volumes and output, for a final mix made away from the mixer.
+    pub fn levels(&self) -> Levels {
+        Levels { volume: self.volume, output: self.output }
+    }
+
+    /// the rest of tick once the configuration is read.
+    pub fn finish(&mut self, memory: &mut Memory, layout: Layout, read: u32, mixes: [QuadFrame; 3]) -> Frame {
+        let write = 1 - read;
 
         // mixes 1 and 2 go out to the title, and what it made of the last
         // ones comes back
@@ -90,15 +111,8 @@ impl Mixer {
             }
         }
 
-        let mut frame = [[0i16; 2]; FRAME_SAMPLES];
-        for (volume, mix) in self.volume.iter().zip(&self.mixes) {
-            downmix(&mut frame, mix, *volume, self.output);
-        }
-        let samples = layout.final_samples + write * REGION_STRIDE;
-        for (i, pair) in frame.iter().enumerate() {
-            memory.write16(samples + i as u32 * 4, pair[0] as u16);
-            memory.write16(samples + i as u32 * 4 + 2, pair[1] as u16);
-        }
+        let frame = final_mix(&self.mixes, self.levels());
+        write_final(memory, layout, write, &frame);
         frame
     }
 
@@ -144,6 +158,31 @@ fn sample_at(channel: usize, sample: usize) -> u32 {
 }
 
 /// adds a four channel mix to the stereo output at a volume.
+/// the mixer's volumes and output format.
+#[derive(Debug, Clone, Copy)]
+pub struct Levels {
+    volume: [f32; 3],
+    output: Output,
+}
+
+/// what the speakers play of the three intermediate mixes.
+pub fn final_mix(mixes: &[QuadFrame; 3], levels: Levels) -> Frame {
+    let mut frame = [[0i16; 2]; FRAME_SAMPLES];
+    for (volume, mix) in levels.volume.iter().zip(mixes) {
+        downmix(&mut frame, mix, *volume, levels.output);
+    }
+    frame
+}
+
+/// puts what was played where the title can read it, in region write.
+pub fn write_final(memory: &mut Memory, layout: Layout, write: u32, frame: &Frame) {
+    let samples = layout.final_samples + write * REGION_STRIDE;
+    for (i, pair) in frame.iter().enumerate() {
+        memory.write16(samples + i as u32 * 4, pair[0] as u16);
+        memory.write16(samples + i as u32 * 4 + 2, pair[1] as u16);
+    }
+}
+
 fn downmix(frame: &mut Frame, mix: &QuadFrame, volume: f32, output: Output) {
     let clamp = |value: f32| (value as i32).clamp(-32768, 32767);
     for (out, sample) in frame.iter_mut().zip(mix) {

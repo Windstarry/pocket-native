@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use zakuro_core::services::hid::PadState;
 
-use crate::settings::{Buttons, Settings, Speed, Stick};
+use crate::settings::{Buttons, Dpad, Settings, Speed, Stick};
 
 pub const A: u16 = 305;
 pub const B: u16 = 304;
@@ -42,21 +42,59 @@ const BUTTONS: [(u16, PadState); 12] = [
     (RIGHT, PadState::RIGHT),
 ];
 /// a stick's travel, the most it reports.
-const STICK: f32 = 1800.0;
+pub const STICK: f32 = 1800.0;
 
 #[derive(Default)]
 pub struct Pad {
     pub keys: HashSet<u16>,
+    /// keys let go since the frontend last looked, which it takes as held
+    /// once: a phone's back gesture comes down and up at once.
+    pub let_go: HashSet<u16>,
     pub axes: [i32; 8],
+    /// the fingers on the screen, each's id and where it is in the layout's
+    /// size, from a handheld's touch screen, and those lifted since the
+    /// frontend last looked, which it takes as down once.
+    pub fingers: Vec<(i32, f32, f32)>,
+    pub lifted: Vec<(i32, f32, f32)>,
+    /// set once a gamepad is used, which hides the touch controls until a
+    /// finger is on the screen again.
+    pub pad_used: bool,
+    /// a finger on a second window's screen, across and down it from 0 to 1.
+    pub second_touch: Option<(f32, f32)>,
+}
+
+/// the pad a program around the frontend fills, in place of evdev's.
+static SHARED: std::sync::OnceLock<Arc<Mutex<Pad>>> = std::sync::OnceLock::new();
+
+/// set when the program around the frontend wants the game to stop, which
+/// saves the settings and ends it, as quitting from the menu does.
+pub static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// the pad for the program around the frontend to fill, the same one each
+/// call, which the frontend then reads in place of evdev.
+pub fn share() -> Arc<Mutex<Pad>> {
+    SHARED.get_or_init(Default::default).clone()
+}
+
+/// set while the program around the frontend is away, an Android app in the
+/// background: the game holds still until it is back.
+pub static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// the pad shared, when there is one.
+pub fn shared() -> Option<Arc<Mutex<Pad>>> {
+    SHARED.get().cloned()
 }
 
 /// the handheld's gamepad device and its name.
 pub fn gamepad() -> Option<(String, String)> {
     let devices = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
-    devices.split("\n\n").find_map(|block| {
+    // muOS hides the pad it reads behind its own, so that one goes first
+    let mut blocks: Vec<&str> = devices.split("\n\n").collect();
+    blocks.sort_by_key(|block| !block.contains("N: Name=\"muOS-Keys\""));
+    blocks.into_iter().find_map(|block| {
         // the name comes in quotes
         let name = block.lines().find_map(|line| line.strip_prefix("N: Name="))?.trim_matches('"');
-        if !name.contains("Gamepad") && !name.contains("Controller") && !name.contains("Joypad") && !name.contains("joypad") && !h700_pad(name) && !rk3562_pad(name) {
+        if !name.contains("Gamepad") && !name.contains("Controller") && !name.contains("Joypad") && !name.contains("joypad") && !h700_pad(name) && !rk3562_pad(name) && name != "muOS-Keys" {
             return None;
         }
         let handlers = block.lines().find_map(|line| line.strip_prefix("H: Handlers="))?;
@@ -79,8 +117,14 @@ fn rk3562_pad(name: &str) -> bool {
 }
 
 pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
+    // muOS calls its pad muOS-Keys: on its release the kernel's, numbered as
+    // on the H700 handhelds, and from the next one a pad muOS makes itself,
+    // vendor 756d, with the usual gamepad numbers and the d-pad as a hat
+    let event = path.rsplit('/').next().unwrap_or_default();
+    let vendor = std::fs::read_to_string(format!("/sys/class/input/{event}/device/id/vendor")).unwrap_or_default();
+    let muos = name == "muOS-Keys" && vendor.trim() == "756d";
     // they come in as the R36S's
-    let h700 = h700_pad(&name);
+    let h700 = h700_pad(&name) || (name == "muOS-Keys" && !muos);
     // Anbernic's RK3566 handhelds (RG353, RG503) give select, start, the
     // sticks' buttons and the right stick the usual numbers
     let rk3566 = name.starts_with("retrogame_joypad");
@@ -95,16 +139,19 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
             ", numbered as on Anbernic's RK3566 handhelds"
         } else if rk3562 {
             ", numbered as on the RK3562 handhelds"
+        } else if muos {
+            ", numbered as on muOS"
         } else {
             ""
         }
     );
     // the R36S's stick each of axes 0 to 5 is, scaled to its travel
     let sticks = if h700 {
+        // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
         Some([None, None, Some(0), Some(1), Some(3), Some(4)])
     } else if rk3566 {
         Some([Some(0), Some(1), Some(3), None, None, Some(4)])
-    } else if rk3562 {
+    } else if rk3562 || muos {
         // left stick on ABS_X and ABS_Y, right on ABS_RX and ABS_RY, the
         // triggers on ABS_Z and ABS_RZ, which are buttons here
         Some([Some(0), Some(1), None, Some(3), Some(4), None])
@@ -117,6 +164,16 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
             return;
         };
         let ranges: [Option<(i32, i32)>; 6] = std::array::from_fn(|axis| sticks.and_then(|_| axis_range(&device, axis)));
+        // an H700 pad short of one of ABS_Z to ABS_RZ, as the RG40XXV's
+        // seems to be, has its sticks on the axes it has, in their order, as
+        // RetroArch takes them
+        let sticks = if h700 && ranges[2..].iter().any(Option::is_none) && ranges.iter().flatten().count() >= 2 {
+            let ordered = sticks_in_order(ranges.map(|range| range.is_some()));
+            log::info!("sticks from the axes it has, {ordered:?}");
+            Some(ordered)
+        } else {
+            sticks
+        };
         let mut event = [0u8; 24];
         while device.read_exact(&mut event).is_ok() {
             let kind = u16::from_ne_bytes([event[16], event[17]]);
@@ -131,6 +188,8 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         rk3566_button(code)
                     } else if rk3562 {
                         rk3562_button(code)
+                    } else if muos {
+                        muos_button(code)
                     } else {
                         code
                     };
@@ -140,7 +199,7 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         pad.keys.insert(code);
                     }
                 }
-                (3, _) if h700 && matches!(code, 16 | 17) => {
+                (3, _) if (h700 || muos) && matches!(code, 16 | 17) => {
                     let (less, more) = if code == 16 { (LEFT, RIGHT) } else { (UP, DOWN) };
                     pad.keys.remove(&less);
                     pad.keys.remove(&more);
@@ -212,6 +271,33 @@ fn rk3562_button(code: u16) -> u16 {
     }
 }
 
+/// a button of muOS's pad as the R36S numbers it: A and B the other way
+/// round, select, start, home and the sticks' buttons the usual gamepad
+/// codes. X, Y, the shoulders and the triggers already have the R36S's.
+fn muos_button(code: u16) -> u16 {
+    match code {
+        304 => A,
+        305 => B,
+        314 => SELECT,
+        315 => START,
+        316 => FN,
+        317 => L3,
+        318 => R3,
+        other => other,
+    }
+}
+
+/// the first two axes a pad has as the left stick and the next two as the
+/// right, the R36S's stick each of axes 0 to 5 is.
+fn sticks_in_order(has: [bool; 6]) -> [Option<usize>; 6] {
+    let mut sticks = [None; 6];
+    let mut targets = [0, 1, 3, 4].into_iter();
+    for axis in (0..6).filter(|&axis| has[axis]) {
+        sticks[axis] = targets.next();
+    }
+    sticks
+}
+
 /// an axis's least and most, as the device gives them.
 fn axis_range(device: &std::fs::File, axis: usize) -> Option<(i32, i32)> {
     let mut info = [0i32; 6];
@@ -234,6 +320,7 @@ pub fn parse_keys(spec: &str) -> Vec<(u64, HashSet<u16>)> {
         "L2" => Some(L2),
         "R2" => Some(R2),
         "L3" => Some(L3),
+        "R3" => Some(R3),
         "SELECT" => Some(SELECT),
         "START" => Some(START),
         "FN" => Some(FN),
@@ -267,11 +354,14 @@ pub fn controls(keys: &HashSet<u16>, axes: &[i32; 8], settings: &Settings) -> (P
             (Buttons::Xbox, Y) => X,
             _ => key,
         };
-        if keys.contains(&key) {
+        if keys.contains(&key) && (settings.dpad == Dpad::Dpad || ![UP, DOWN, LEFT, RIGHT].contains(&key)) {
             buttons |= button;
         }
     }
-    let (x, y) = (stick(axes[0]), -stick(axes[1]));
+    let (x, y) = match dpad(keys) {
+        (across, down) if settings.dpad == Dpad::CirclePad && (across, down) != (0.0, 0.0) => (across, -down),
+        _ => (stick(axes[0]), -stick(axes[1])),
+    };
     match settings.left_stick {
         Stick::CirclePad => (buttons, x, y),
         Stick::Dpad => {
@@ -285,11 +375,32 @@ pub fn controls(keys: &HashSet<u16>, axes: &[i32; 8], settings: &Settings) -> (P
     }
 }
 
+/// the d-pad held as a stick's position, across and down.
+pub fn dpad(keys: &HashSet<u16>) -> (f32, f32) {
+    let axis = |less: u16, more: u16| keys.contains(&more) as i32 as f32 - keys.contains(&less) as i32 as f32;
+    (axis(LEFT, RIGHT), axis(UP, DOWN))
+}
+
 /// how far the touch cursor goes a frame with the right stick held over.
 pub fn cursor_step(speed: Speed) -> f32 {
     match speed {
         Speed::Slow => 2.0,
         Speed::Normal => 4.0,
         Speed::Fast => 7.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sticks_in_order;
+
+    #[test]
+    fn sticks_follow_the_axes_a_pad_has() {
+        // ABS_Z to ABS_RZ, as on the H700 handhelds the usual mapping fits
+        assert_eq!(sticks_in_order([false, false, true, true, true, true]), [None, None, Some(0), Some(1), Some(3), Some(4)]);
+        // no ABS_RX: the left stick on ABS_Y and ABS_Z, as muOS reads them
+        assert_eq!(sticks_in_order([false, true, true, false, true, true]), [None, Some(0), Some(1), None, Some(3), Some(4)]);
+        // one stick only
+        assert_eq!(sticks_in_order([false, false, false, true, true, false]), [None, None, None, Some(0), Some(1), None]);
     }
 }

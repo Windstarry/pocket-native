@@ -55,11 +55,21 @@ pub struct Kernel {
     /// flips while a thread starves the ones below it, handing every other
     /// slice to them.
     relief: bool,
+    /// a thread began or stopped waiting, or a mutex changed hands, so the
+    /// priorities lent have to be worked out again.
+    priorities_stale: bool,
 
     /// cached objects backing the pseudo-handles, so that duplicating
     /// CUR_THREAD_HANDLE twice yields the same object.
     thread_objects: std::collections::HashMap<ThreadId, ObjectId>,
     process_object: Option<ObjectId>,
+
+    /// the timers, gone through for the next one due instead of every
+    /// object, gathered again each frame.
+    pub timers: Vec<ObjectId>,
+    /// pulse events and timers signalled since the last schedule, which
+    /// clear once it released whatever waited on them.
+    pub pulsed: Vec<ObjectId>,
 }
 
 impl Kernel {
@@ -81,8 +91,11 @@ impl Kernel {
             reschedule_pending: false,
             all_blocked: false,
             relief: false,
+            priorities_stale: false,
             thread_objects: std::collections::HashMap::new(),
             process_object: None,
+            timers: Vec::new(),
+            pulsed: Vec::new(),
         }
     }
 
@@ -153,6 +166,8 @@ impl Kernel {
             return object;
         }
         let object = self.objects.insert(KObject::Thread(id));
+        // kept for every handle after, closed or not
+        self.objects.add_ref(object);
         self.thread_objects.insert(id, object);
         object
     }
@@ -162,6 +177,7 @@ impl Kernel {
             return object;
         }
         let object = self.objects.insert(KObject::Process);
+        self.objects.add_ref(object);
         self.process_object = Some(object);
         object
     }
@@ -190,12 +206,23 @@ impl Kernel {
     /// wakes anything whose wait has been satisfied, then switches to the
     /// highest-priority runnable thread.
     pub fn schedule(&mut self, cpu: &mut Cpu, tick: u64) -> bool {
+        self.fire_timers(tick);
         let mut live = std::mem::take(&mut self.live);
         live.retain(|&id| self.threads[id as usize].status != ThreadStatus::Dead);
         for &id in &live {
             self.try_satisfy_wait(id, tick);
         }
         self.live = live;
+        if std::mem::take(&mut self.priorities_stale) {
+            self.lend_priorities();
+        }
+        for id in std::mem::take(&mut self.pulsed) {
+            match self.objects.get_mut(id) {
+                Some(KObject::Event(event)) => event.signaled = false,
+                Some(KObject::Timer(timer)) => timer.signaled = false,
+                _ => {}
+            }
+        }
 
         if let Some(current) = self.current_thread {
             let thread = &mut self.threads[current as usize];
@@ -303,6 +330,63 @@ impl Kernel {
         self.live.iter().filter(|id| **id >= start).find(ready).or_else(|| self.live.iter().find(ready)).copied()
     }
 
+    /// fires the timers whose time has come, once however many periods went
+    /// by, and arms the periodic ones again for their first period after
+    /// tick, counted from when they came due as the console counts. a pulse
+    /// releases what waits on it then, and clears after. whether any fired.
+    fn fire_timers(&mut self, tick: u64) -> bool {
+        let mut fired = false;
+        for &id in &self.timers {
+            if let Some(KObject::Timer(timer)) = self.objects.get_mut(id) {
+                let Some(at) = timer.fire_at.filter(|&at| at <= tick) else { continue };
+                timer.signaled = true;
+                timer.fire_at = (timer.interval > 0)
+                    .then(|| at.saturating_add(timer.interval.saturating_mul((tick - at) / timer.interval + 1)));
+                if timer.reset_type == ResetType::Pulse {
+                    self.pulsed.push(id);
+                }
+                fired = true;
+            }
+        }
+        fired
+    }
+
+    /// fires what came due before a title sets, clears, cancels or waits on
+    /// a timer, as the console's interrupt had by then. a pulse nobody waits
+    /// on is lost.
+    pub(crate) fn catch_up_timers(&mut self, tick: u64) {
+        if !self.fire_timers(tick) {
+            return;
+        }
+        self.reschedule_pending = true;
+        let threads = &self.threads;
+        let objects = &mut self.objects;
+        self.pulsed.retain(|&id| {
+            let waited = threads.iter().any(|t| t.status == ThreadStatus::WaitSync && t.wait_objects.contains(&id));
+            if !waited {
+                if let Some(KObject::Timer(timer)) = objects.get_mut(id) {
+                    timer.signaled = false;
+                }
+            }
+            waited
+        });
+    }
+
+    /// the earliest tick a blocked thread or a timer wants the scheduler at.
+    /// a timer only matters then to a thread waiting on it, the rest fire
+    /// when the scheduler next looks or the title next touches them.
+    pub fn next_event(&self) -> Option<u64> {
+        let blocked = || self.live.iter().map(|&id| &self.threads[id as usize]).filter(|t| t.status.is_blocked());
+        let threads = blocked().filter_map(|t| t.wakeup_at);
+        let timers = self.timers.iter().filter(|&&id| blocked().any(|t| t.wait_objects.contains(&id))).filter_map(|&id| {
+            match self.objects.get(id) {
+                Some(KObject::Timer(timer)) => timer.fire_at,
+                _ => None,
+            }
+        });
+        threads.chain(timers).min()
+    }
+
     /// checks one blocked thread's condition and unblocks it if satisfied.
     fn try_satisfy_wait(&mut self, id: ThreadId, tick: u64) -> bool {
         let thread = &self.threads[id as usize];
@@ -315,9 +399,8 @@ impl Kernel {
         match thread.status {
             ThreadStatus::Sleeping => {
                 if timed_out {
-                    let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
-                    thread.status = ThreadStatus::Ready;
+                    self.end_wait(id);
+                    self.threads[id as usize].status = ThreadStatus::Ready;
                     return true;
                 }
             }
@@ -342,16 +425,16 @@ impl Kernel {
                         self.acquire(objects[index], id);
                         index
                     };
+                    self.end_wait(id);
                     let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
                     thread.wait_result = Some(WaitResult::Signaled(index));
                     thread.status = ThreadStatus::Ready;
                     return true;
                 }
 
                 if timed_out {
+                    self.end_wait(id);
                     let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
                     thread.wait_result = Some(WaitResult::TimedOut);
                     thread.status = ThreadStatus::Ready;
                     return true;
@@ -361,8 +444,8 @@ impl Kernel {
                 // arbiter waits are released explicitly by a signalling
                 // thread, only the timeout is handled here.
                 if timed_out => {
+                    self.end_wait(id);
                     let thread = &mut self.threads[id as usize];
-                    thread.clear_wait();
                     thread.wait_result = Some(WaitResult::TimedOut);
                     thread.status = ThreadStatus::Ready;
                     return true;
@@ -410,6 +493,7 @@ impl Kernel {
             Some(KObject::Mutex(mutex)) => {
                 mutex.owner = Some(waiter);
                 mutex.lock_count += 1;
+                self.priorities_stale = true;
             }
             _ => {}
         }
@@ -424,6 +508,11 @@ impl Kernel {
         tick: u64,
     ) {
         let Some(id) = self.current_thread else { return };
+        // what a thread waits on stays while it does, a handle to it closed
+        // meanwhile can't free it and hand its place to the next object
+        for &object in &objects {
+            self.objects.add_ref(object);
+        }
         let thread = &mut self.threads[id as usize];
         thread.wait_objects = objects;
         thread.wait_all = wait_all;
@@ -431,6 +520,51 @@ impl Kernel {
         thread.wait_result = None;
         thread.status = ThreadStatus::WaitSync;
         self.reschedule_pending = true;
+        self.priorities_stale = true;
+    }
+
+    /// a thread holding a mutex runs at the priority of the most urgent
+    /// thread waiting on it when that is higher than its own, as on the
+    /// console, so a low priority thread holding a lock a high one waits on
+    /// gets the core to give it back. lent on along a chain of holders that
+    /// wait in turn.
+    fn lend_priorities(&mut self) {
+        for &id in &self.live {
+            let thread = &mut self.threads[id as usize];
+            thread.priority = thread.base_priority;
+        }
+        loop {
+            let lent: Vec<(ThreadId, u32)> = self
+                .live
+                .iter()
+                .map(|&id| &self.threads[id as usize])
+                .filter(|waiter| waiter.status == ThreadStatus::WaitSync)
+                .flat_map(|waiter| {
+                    waiter.wait_objects.iter().filter_map(|&object| match self.objects.get(object) {
+                        Some(KObject::Mutex(mutex)) => mutex.owner.map(|owner| (owner, waiter.priority)),
+                        _ => None,
+                    })
+                })
+                .filter(|&(owner, priority)| self.threads[owner as usize].priority > priority)
+                .collect();
+            if lent.is_empty() {
+                return;
+            }
+            for (owner, priority) in lent {
+                let thread = &mut self.threads[owner as usize];
+                thread.priority = thread.priority.min(priority);
+            }
+        }
+    }
+
+    /// ends a thread's wait, letting go of the objects it kept while it
+    /// waited.
+    fn end_wait(&mut self, id: ThreadId) {
+        for object in std::mem::take(&mut self.threads[id as usize].wait_objects) {
+            self.objects.release(object);
+        }
+        self.threads[id as usize].clear_wait();
+        self.priorities_stale = true;
     }
 
     /// whether a thread besides the current one could run.
@@ -456,12 +590,12 @@ impl Kernel {
     /// down, the way the console's kernel does. one held by a dead thread
     /// would block whoever waits on it next forever.
     pub fn end_thread(&mut self, id: ThreadId) {
+        self.end_wait(id);
         let thread = &mut self.threads[id as usize];
         if thread.status != ThreadStatus::Dead {
             self.free_tls.push(thread.tls);
         }
         thread.status = ThreadStatus::Dead;
-        thread.clear_wait();
         thread.wait_result = None;
         thread.wait_syscall = None;
         let held: Vec<ObjectId> = self
@@ -486,7 +620,16 @@ impl Kernel {
     /// signals an event, waking anything waiting on it at the next scheduling
     /// point.
     pub fn signal_event(&mut self, object: ObjectId) {
+        let waited = self.threads.iter().any(|t| t.status == ThreadStatus::WaitSync && t.wait_objects.contains(&object));
         if let Some(KObject::Event(event)) = self.objects.get_mut(object) {
+            // a pulse wakes what waits on it now, and is gone after, lost
+            // when nothing does
+            if event.reset_type == ResetType::Pulse {
+                if !waited {
+                    return;
+                }
+                self.pulsed.push(object);
+            }
             event.signaled = true;
             self.reschedule_pending = true;
         }
@@ -599,6 +742,10 @@ mod tests {
         mutex.owner = Some(holder);
         mutex.lock_count = 2;
         let object = kernel.objects.insert(KObject::Mutex(mutex));
+        // a handle the title holds, and the wait's own hold, as begin_wait
+        // takes it
+        kernel.objects.add_ref(object);
+        kernel.objects.add_ref(object);
         let thread = &mut kernel.threads[waiter as usize];
         thread.wait_objects = vec![object];
         thread.status = ThreadStatus::WaitSync;
@@ -619,5 +766,36 @@ mod tests {
         assert!(matches!(thread.wait_result, Some(WaitResult::Signaled(0))));
         let Some(KObject::Mutex(mutex)) = kernel.objects.get(object) else { panic!("the mutex is gone") };
         assert_eq!((mutex.owner, mutex.lock_count), (Some(waiter), 1));
+    }
+    /// a low priority thread holding a mutex a high one waits on runs at the
+    /// high one's priority, ahead of a middle one that is ready, and goes
+    /// back to its own once it lets go, as on the console.
+    #[test]
+    fn a_mutex_holder_runs_at_its_waiters_priority() {
+        let mut kernel = Kernel::new(0, MemoryRegion::Application, 0x1400_0000);
+        let low = kernel.create_thread("low", 0x0010_0000, 0x1000_0000, 0, 0x30, 0);
+        let middle = kernel.create_thread("middle", 0x0010_0000, 0x0FF0_0000, 0, 0x28, 0);
+        let high = kernel.create_thread("high", 0x0010_0000, 0x0FE0_0000, 0, 0x20, 0);
+        let mut mutex = sync::Mutex::new("Mutex");
+        mutex.owner = Some(low);
+        mutex.lock_count = 1;
+        let object = kernel.objects.insert(KObject::Mutex(mutex));
+        kernel.objects.add_ref(object);
+        kernel.current_thread = Some(high);
+        kernel.begin_wait(vec![object], false, None, 0);
+        kernel.current_thread = None;
+        let mut cpu = Cpu::new();
+        kernel.schedule(&mut cpu, 0);
+        assert_eq!(kernel.thread(low).priority, 0x20);
+        assert_eq!(kernel.current_thread, Some(low));
+        assert_eq!(kernel.thread(middle).status, ThreadStatus::Ready);
+
+        let Some(KObject::Mutex(mutex)) = kernel.objects.get_mut(object) else { panic!("the mutex is gone") };
+        mutex.owner = None;
+        mutex.lock_count = 0;
+        kernel.priorities_stale = true;
+        kernel.schedule(&mut cpu, 1);
+        assert_eq!(kernel.thread(low).priority, 0x30);
+        assert_eq!(kernel.current_thread, Some(high));
     }
 }

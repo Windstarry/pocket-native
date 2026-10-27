@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pocket Native on Android: the launcher, a plain activity of its own,
+     and the game, a NativeActivity that loads libpocketnative.so in a
+     process of its own, so that quitting a game ends it. make_apk.sh fills
+     in the package, version and label. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="@PACKAGE@"
+    android:installLocation="auto"
+    android:versionCode="@VERSION_CODE@"
+    android:versionName="@VERSION@">
+
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="34" />
+    <uses-feature android:glEsVersion="0x00030001" android:required="true" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <!-- Update: the latest release from GitHub, installed after asking -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <application
+        android:label="@LABEL@"
+        android:hasCode="true"
+        android:extractNativeLibs="false"
+        android:isGame="true"
+        android:appCategory="game"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <activity
+            android:name="io.github.pocketnative.Launcher"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name="io.github.pocketnative.Game"
+            android:exported="false"
+            android:process=":game"
+            android:taskAffinity="@PACKAGE@.game"
+            android:resizeableActivity="false"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
+            <meta-data android:name="android.app.lib_name" android:value="pocketnative" />
+        </activity>
+    </application>
+</manifest>

@@ -70,6 +70,63 @@ fn set_field(memory: &mut Memory, base: VAddr, offset: u32, value: u32) {
     memory.write32(base + offset, value);
 }
 
+// ---------------------------------------------------------------------------
+// The lists the title walks
+// ---------------------------------------------------------------------------
+
+/// puts a module at the end of the list it goes in, which the title walks
+/// from the static module to find what modules export. the static module's
+/// next field heads the modules that link on their own, its previous field
+/// the others. a list's head keeps its tail in its previous field, and the
+/// tail has no next.
+fn register(memory: &mut Memory, crs: VAddr, base: VAddr, auto_link: bool) {
+    let head_field = if auto_link { header::NEXT_CRO } else { header::PREVIOUS_CRO };
+    let head = field(memory, crs, head_field);
+    if head == 0 {
+        set_field(memory, crs, head_field, base);
+        set_field(memory, base, header::PREVIOUS_CRO, base);
+    } else {
+        let tail = field(memory, head, header::PREVIOUS_CRO);
+        set_field(memory, tail, header::NEXT_CRO, base);
+        set_field(memory, base, header::PREVIOUS_CRO, tail);
+        set_field(memory, head, header::PREVIOUS_CRO, base);
+    }
+    set_field(memory, base, header::NEXT_CRO, 0);
+}
+
+/// takes a module out of the list it is in.
+fn unregister(memory: &mut Memory, crs: VAddr, base: VAddr) {
+    let next = field(memory, base, header::NEXT_CRO);
+    let previous = field(memory, base, header::PREVIOUS_CRO);
+    // one in a list has a previous, itself when alone. one loaded before
+    // the lists were kept, from an older saved state, is in none
+    if previous == 0 {
+        return;
+    }
+    let heads = [header::NEXT_CRO, header::PREVIOUS_CRO];
+    if let Some(head_field) = heads.into_iter().find(|&head_field| field(memory, crs, head_field) == base) {
+        // the head, the one after it heads the list now and keeps the tail
+        if next != 0 {
+            set_field(memory, next, header::PREVIOUS_CRO, previous);
+        }
+        set_field(memory, crs, head_field, next);
+    } else if next != 0 {
+        set_field(memory, previous, header::NEXT_CRO, next);
+        set_field(memory, next, header::PREVIOUS_CRO, previous);
+    } else {
+        // the tail, the one before it is the tail now
+        set_field(memory, previous, header::NEXT_CRO, 0);
+        for head_field in heads {
+            let head = field(memory, crs, head_field);
+            if head != 0 && field(memory, head, header::PREVIOUS_CRO) == base {
+                set_field(memory, head, header::PREVIOUS_CRO, previous);
+            }
+        }
+    }
+    set_field(memory, base, header::NEXT_CRO, 0);
+    set_field(memory, base, header::PREVIOUS_CRO, 0);
+}
+
 fn segment(memory: &mut Memory, base: VAddr, index: u32) -> Option<Segment> {
     if index >= field(memory, base, header::SEGMENT_NUM) {
         return None;
@@ -688,6 +745,9 @@ impl CroManager {
         let segments = self.read_segments(memory, base);
         let name_offset = field(memory, base, header::MODULE_NAME_OFFSET);
         let name = read_string(memory, name_offset);
+        // no module hangs off it yet
+        set_field(memory, base, header::NEXT_CRO, 0);
+        set_field(memory, base, header::PREVIOUS_CRO, 0);
 
         log::info!(
             "ldr:ro: static module '{name}' at 0x{base:08X} exports {} named symbols",
@@ -748,6 +808,9 @@ impl CroManager {
             auto_link,
         });
         let index = self.modules.len() - 1;
+        if let Some(crs) = self.crs {
+            register(memory, crs, base, auto_link);
+        }
 
         // link it against what is already there, then let what is already
         // there link against it.
@@ -820,6 +883,9 @@ impl CroManager {
             }
         }
 
+        if let Some(crs) = self.crs {
+            unregister(memory, crs, base);
+        }
         unrebase(memory, base);
     }
 
@@ -913,4 +979,56 @@ fn unrebase(memory: &mut Memory, base: VAddr) {
         offset_field += 8;
     }
     set_field(memory, base, header::FIXED_SIZE, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{MemoryRegion, MemoryState, Permission};
+
+    /// the static module's header and four modules', in memory of their own.
+    fn headers() -> (crate::System, VAddr, [VAddr; 4]) {
+        let mut system = crate::System::new(crate::Config::default());
+        let block = system.memory.phys.allocate(MemoryRegion::Application, 0x1000).unwrap();
+        system.memory.map(0x0070_0000, block.addr, 0x1000, Permission::RW, MemoryState::Private);
+        let at = |index: u32| 0x0070_0000 + index * 0x200;
+        (system, at(0), [at(1), at(2), at(3), at(4)])
+    }
+
+    /// a header's next and previous fields.
+    fn links(memory: &mut Memory, base: VAddr) -> (VAddr, VAddr) {
+        (field(memory, base, header::NEXT_CRO), field(memory, base, header::PREVIOUS_CRO))
+    }
+
+    /// modules join the end of their list and leave it from anywhere in it,
+    /// and the title walking it from the static module finds them in order.
+    #[test]
+    fn modules_go_in_and_out_of_the_lists_the_title_walks() {
+        let (mut system, crs, [a, b, c, d]) = headers();
+        let memory = &mut system.memory;
+        register(memory, crs, a, true);
+        register(memory, crs, b, true);
+        register(memory, crs, c, true);
+        register(memory, crs, d, false);
+        assert_eq!(links(memory, crs), (a, d), "the heads of both lists");
+        assert_eq!(links(memory, a), (b, c), "the head keeps the tail");
+        assert_eq!(links(memory, b), (c, a));
+        assert_eq!(links(memory, c), (0, b));
+        assert_eq!(links(memory, d), (0, d), "alone in its list");
+
+        unregister(memory, crs, b);
+        assert_eq!((links(memory, a), links(memory, c), links(memory, b)), ((c, c), (0, a), (0, 0)), "from the middle");
+        unregister(memory, crs, c);
+        assert_eq!(links(memory, a), (0, a), "the tail");
+        register(memory, crs, b, true);
+        unregister(memory, crs, a);
+        assert_eq!((links(memory, crs), links(memory, b)), ((b, d), (0, b)), "the head");
+        unregister(memory, crs, b);
+        unregister(memory, crs, d);
+        assert_eq!(links(memory, crs), (0, 0), "the last ones");
+        // one in no list, from before the lists were kept, stays out
+        register(memory, crs, a, true);
+        unregister(memory, crs, c);
+        assert_eq!((links(memory, crs), links(memory, a)), ((a, 0), (0, a)), "in none");
+    }
 }

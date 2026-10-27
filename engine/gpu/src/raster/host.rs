@@ -33,6 +33,15 @@ pub(super) struct Draw<'a> {
     /// whether the procedural texture is on, and its tables.
     pub(super) proctex: bool,
     pub(super) proctex_tables: &'a proctex::Tables,
+    /// whether the fog is on, and its table.
+    pub(super) fog: bool,
+    pub(super) fog_table: &'a crate::fog::Table,
+    /// what the fragment registers' changes number, the same as the last
+    /// draw's while none changed.
+    pub(super) fragment_state: u64,
+    /// shaded on the CPU only until its own program is built, which needs
+    /// no program of its own for those few frames.
+    pub(super) stand_in: bool,
 }
 
 /// the triangles of a draw.
@@ -98,4 +107,7 @@ pub(crate) struct Transfer {
     pub(crate) output_tiled: bool,
     pub(crate) input_format: ColorFormat,
     pub(crate) output_format: ColorFormat,
+    /// the input pixels skipped at the left of each row, a texture copy of
+    /// part of a picture's width.
+    pub(crate) column: u32,
 }

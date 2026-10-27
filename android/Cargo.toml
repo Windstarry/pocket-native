@@ -1,0 +1,20 @@
+[package]
+name = "pocket-native-android"
+description = "Pocket Native's game activity on Android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# the shared library the game's NativeActivity loads, libpocketnative.so,
+# empty anywhere but Android
+[lib]
+name = "pocketnative"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+pocket-native = { path = "../frontend" }
+zakuro-gpu.workspace = true
+log.workspace = true
+android-activity = { version = "0.6.1", features = ["native-activity"] }
+jni = "0.21"

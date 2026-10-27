@@ -42,6 +42,14 @@ bitflags::bitflags! {
         const L = 1 << 9;
         const X = 1 << 10;
         const Y = 1 << 11;
+        /// the New 3DS's and the Circle Pad Pro's, which ir:rst reports and
+        /// not HID, in the same places.
+        const ZL = 1 << 14;
+        const ZR = 1 << 15;
+        const C_STICK_RIGHT = 1 << 24;
+        const C_STICK_LEFT = 1 << 25;
+        const C_STICK_UP = 1 << 26;
+        const C_STICK_DOWN = 1 << 27;
         /// set by the driver when the circle pad is pushed far enough in a
         /// direction, games use these instead of reading the axes.
         const CIRCLE_RIGHT = 1 << 28;
@@ -58,6 +66,9 @@ pub struct InputState {
     /// circle pad, -1.0 to 1.0 on each axis.
     pub circle_x: f32,
     pub circle_y: f32,
+    /// the C-stick, the same way.
+    pub c_stick_x: f32,
+    pub c_stick_y: f32,
     /// touch position in screen pixels, when touched.
     pub touch: Option<(u16, u16)>,
     /// how far the console is tilted, for the motion sensors, -1.0 to 1.0
@@ -176,9 +187,30 @@ fn ensure_resources(system: &mut System) {
         "HID:DebugPad",
     ] {
         let (object, handle) = system.kernel.create_event(ResetType::OneShot, name);
+        // signalled every frame, so kept whatever the title does with its
+        // handle, a closed one can't hand the event's place to the next object
+        system.kernel.objects.add_ref(object);
         system.services.hid.events.push(handle);
         system.services.hid.event_objects.push(object);
     }
+}
+
+/// the C-stick's direction bits.
+pub const C_STICK: PadState = PadState::C_STICK_RIGHT
+    .union(PadState::C_STICK_LEFT)
+    .union(PadState::C_STICK_UP)
+    .union(PadState::C_STICK_DOWN);
+
+/// the direction bits a stick pushed this far sets, right, left, up and down,
+/// past half way on an axis.
+pub fn directions(x: f32, y: f32, [right, left, up, down]: [PadState; 4]) -> PadState {
+    const THRESHOLD: f32 = 0.5;
+    let mut bits = PadState::empty();
+    bits.set(right, x > THRESHOLD);
+    bits.set(left, x < -THRESHOLD);
+    bits.set(up, y > THRESHOLD);
+    bits.set(down, y < -THRESHOLD);
+    bits
 }
 
 /// offset of a section's ring of samples, past its header.
@@ -224,13 +256,15 @@ pub fn update(system: &mut System, input: InputState) {
         return;
     }
 
-    let mut buttons = input.buttons;
+    // ZL, ZR and the C-stick are ir:rst's to report
+    let mut buttons = input.buttons & !(PadState::ZL | PadState::ZR | C_STICK);
     // the driver synthesises the circle-pad direction bits from the axes.
-    const THRESHOLD: f32 = 0.5;
-    buttons.set(PadState::CIRCLE_RIGHT, input.circle_x > THRESHOLD);
-    buttons.set(PadState::CIRCLE_LEFT, input.circle_x < -THRESHOLD);
-    buttons.set(PadState::CIRCLE_UP, input.circle_y > THRESHOLD);
-    buttons.set(PadState::CIRCLE_DOWN, input.circle_y < -THRESHOLD);
+    buttons |= directions(input.circle_x, input.circle_y, [
+        PadState::CIRCLE_RIGHT,
+        PadState::CIRCLE_LEFT,
+        PadState::CIRCLE_UP,
+        PadState::CIRCLE_DOWN,
+    ]);
 
     let previous = system.services.hid.previous;
     let additions = buttons.bits() & !previous.bits();

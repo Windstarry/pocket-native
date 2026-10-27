@@ -19,6 +19,18 @@ const REG_TABLE_INPUT: usize = 0x1D1;
 const REG_TABLE_SCALE: usize = 0x1D2;
 const REG_LIGHT_SLOTS: usize = 0x1D9;
 
+/// the registers the lighting's shape comes from, each light's flags with
+/// them.
+pub(crate) const SHAPE_REGISTERS: [usize; 17] = {
+    let mut registers = [REG_ENABLE, REG_LIGHT_COUNT, REG_CONFIG0, REG_CONFIG1, REG_DISABLE, REG_TABLE_ABSOLUTE, REG_TABLE_INPUT, REG_TABLE_SCALE, REG_LIGHT_SLOTS, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut light = 0;
+    while light < 8 {
+        registers[9 + light] = REG_LIGHTS + light * 0x10 + 9;
+        light += 1;
+    }
+    registers
+};
+
 /// the tables, the specular distributions, fresnel, the reflections and a
 /// spotlight and a distance attenuation for each light.
 const DISTRIBUTION0: usize = 0;

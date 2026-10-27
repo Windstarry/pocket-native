@@ -1,0 +1,4 @@
+name = "Monster Hunter 4 Ultimate"
+
+[advanced]
+realtime_gpu = true

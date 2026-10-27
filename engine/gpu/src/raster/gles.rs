@@ -17,16 +17,43 @@ use between::{Between, Step};
 use super::{color_words, BoundTexture, DepthMap, DrawnTexture, Screen, Wrap, COLOR_WORDS, TEXTURE_UNIT_BASES};
 use crate::blend::LogicOp;
 use crate::format::{morton_offset, ColorFormat};
+use crate::texture::Packing;
 use crate::lighting::Tables;
 use crate::proctex;
 
 mod between;
 use crate::registers::*;
 use crate::shader::glsl::{self, SEMANTICS};
-use crate::shader::INPUT_REGISTERS;
+use crate::shader::{ShaderUnit, DESCRIPTOR_SIZE, INPUT_REGISTERS, PROGRAM_SIZE};
 use crate::{GpuMemory, Picture, ScreenRef};
 
 const FRAGMENT_SOURCE: &str = include_str!("../../shaders/raster.frag");
+
+/// the alpha test's compare as raster.frag has it, and as Adreno's compiler
+/// takes it: it fails to link the switch where it folds to a constant
+/// function with a discard after it. Only Adreno gets the second, so other
+/// GPUs keep the programs they have cached.
+const SWITCH_COMPARE: &str = "    switch (function) {
+        case 0u: return false;
+        case 1u: return true;
+        case 2u: return value == reference;
+        case 3u: return value != reference;
+        case 4u: return value < reference;
+        case 5u: return value <= reference;
+        case 6u: return value > reference;
+        default: return value >= reference;
+    }";
+const ADRENO_COMPARE: &str = "    if (function < 2u) {
+        return function == 1u;
+    }
+    if (function < 4u) {
+        return (value == reference) == (function == 2u);
+    }
+    if (function < 6u) {
+        return value < reference || (function == 5u && value == reference);
+    }
+    return value > reference || (function == 7u && value == reference);";
+static ADRENO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const VERTEX_SOURCE: &str = r#"#version 310 es
 layout(location = 0) in vec4 position;
@@ -72,6 +99,8 @@ uniform int flip;
 uniform int input_format;
 uniform int output_format;
 uniform int source_row;
+uniform int source_column;
+uniform int target_row;
 uniform int source_height;
 
 uint expand(uint value, uint bits) {
@@ -107,13 +136,104 @@ void main() {
                 y = input_height - 1 - y;
             }
             int row = source_height - 1 - (source_row + y);
-            vec4 texel = imageLoad(source, ivec2(x, row));
+            vec4 texel = imageLoad(source, ivec2(source_column + x, row));
             sum += quantize(uvec4(round(texel * 255.0)), input_format);
         }
     }
     uint count = uint(scale.x * scale.y);
     uvec4 pixel = quantize((sum + count / 2u) / count, output_format);
-    imageStore(target, ivec2(at.x, output_height - 1 - at.y), vec4(pixel) / 255.0);
+    imageStore(target, ivec2(at.x, output_height - 1 - (target_row + at.y)), vec4(pixel) / 255.0);
+}
+"#;
+
+/// a surface's pixels from another's drawn over the same memory in another
+/// format or layout, through the bytes memory would hold, as a write back
+/// and an upload would make them.
+const REINTERPRET_SOURCE: &str = r#"#version 310 es
+precision highp float;
+precision highp int;
+precision highp image2D;
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba8) uniform readonly image2D source;
+layout(binding = 1, rgba8) uniform writeonly image2D target;
+// width, height, bytes a pixel and format of each, whether each is tiled
+uniform ivec4 target_shape;
+uniform ivec4 source_shape;
+uniform ivec2 tiled;
+// the target's first row and how many
+uniform ivec2 rows;
+// how far into the source's memory the target starts
+uniform int delta;
+
+int place(int x, int y, int width, int bpp, int is_tiled) {
+    if (is_tiled == 0) {
+        return (y * width + x) * bpp;
+    }
+    int m = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
+    return (((y >> 3) * (width >> 3) + (x >> 3)) * 64 + m) * bpp;
+}
+
+ivec2 pixel(int index, int width, int is_tiled) {
+    if (is_tiled == 0) {
+        return ivec2(index % width, index / width);
+    }
+    int m = index & 63;
+    int x = (m & 1) | ((m >> 1) & 2) | ((m >> 2) & 4);
+    int y = ((m >> 1) & 1) | ((m >> 2) & 2) | ((m >> 3) & 4);
+    int tile = index >> 6;
+    int across = width >> 3;
+    return ivec2(tile % across * 8 + x, tile / across * 8 + y);
+}
+
+uint encode(uvec4 c, int format) {
+    switch (format) {
+    case 0:
+        return c.a | (c.b << 8) | (c.g << 16) | (c.r << 24);
+    case 1:
+        return c.b | (c.g << 8) | (c.r << 16);
+    case 2:
+        return ((c.r >> 3) << 11) | ((c.g >> 2) << 5) | (c.b >> 3);
+    case 3:
+        return ((c.r >> 3) << 11) | ((c.g >> 3) << 6) | ((c.b >> 3) << 1) | (c.a >= 128u ? 1u : 0u);
+    default:
+        return ((c.r >> 4) << 12) | ((c.g >> 4) << 8) | ((c.b >> 4) << 4) | (c.a >> 4);
+    }
+}
+
+uint expand(uint value, uint bits) {
+    return (value << (8u - bits)) | (value >> (2u * bits - 8u));
+}
+
+uvec4 decode(uint v, int format) {
+    switch (format) {
+    case 0:
+        return uvec4(v >> 24, (v >> 16) & 255u, (v >> 8) & 255u, v & 255u);
+    case 1:
+        return uvec4((v >> 16) & 255u, (v >> 8) & 255u, v & 255u, 255u);
+    case 2:
+        return uvec4(expand(v >> 11, 5u), expand((v >> 5) & 63u, 6u), expand(v & 31u, 5u), 255u);
+    case 3:
+        return uvec4(expand(v >> 11, 5u), expand((v >> 6) & 31u, 5u), expand((v >> 1) & 31u, 5u), (v & 1u) != 0u ? 255u : 0u);
+    default:
+        return uvec4((v >> 12) * 17u, ((v >> 8) & 15u) * 17u, ((v >> 4) & 15u) * 17u, (v & 15u) * 17u);
+    }
+}
+
+void main() {
+    ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= target_shape.x || at.y >= rows.y) {
+        return;
+    }
+    int y = rows.x + at.y;
+    int start = delta + place(at.x, y, target_shape.x, target_shape.z, tiled.x);
+    uint value = 0u;
+    for (int k = 0; k < target_shape.z; k++) {
+        int offset = start + k;
+        ivec2 p = pixel(offset / source_shape.z, source_shape.x, tiled.y);
+        uvec4 c = uvec4(round(imageLoad(source, ivec2(p.x, source_shape.y - 1 - p.y)) * 255.0));
+        value |= ((encode(c, source_shape.w) >> uint(8 * (offset % source_shape.z))) & 255u) << uint(8 * k);
+    }
+    imageStore(target, ivec2(at.x, target_shape.y - 1 - y), vec4(decode(value, target_shape.w)) / 255.0);
 }
 "#;
 
@@ -124,13 +244,16 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0, rgba8) uniform readonly image2D source;
 layout(binding = 1, rgba8) uniform writeonly image2D upright;
 uniform ivec2 size;
+// the source drawn at this over 4 times the console's size
+uniform int quarters;
 
 void main() {
     ivec2 at = ivec2(gl_GlobalInvocationID.xy);
     if (at.x >= size.x || at.y >= size.y) {
         return;
     }
-    imageStore(upright, at, imageLoad(source, ivec2(size.y - 1 - at.y, size.x - 1 - at.x)));
+    ivec2 from = ivec2(size.y - 1 - at.y, size.x - 1 - at.x);
+    imageStore(upright, at, imageLoad(source, (from * quarters + quarters / 2) / 4));
 }
 "#;
 
@@ -204,8 +327,10 @@ void main() {
 
 const VERTEX_SIZE: usize = 24 * 4;
 const PROCTEX_WORDS: usize = 8;
-const UNIFORM_WORDS: usize = 12 * 4 + 4 + 3 * 4 + 4 + 328 + PROCTEX_WORDS + COLOR_WORDS;
-const TABLES_SIZE: usize = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COLOR_ENTRIES) * 8;
+/// the fog's color, and room.
+const FOG_WORDS: usize = 4;
+const UNIFORM_WORDS: usize = 12 * 4 + 4 + 3 * 4 + 4 + 328 + PROCTEX_WORDS + COLOR_WORDS + FOG_WORDS;
+const TABLES_SIZE: usize = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COLOR_ENTRIES + crate::fog::ENTRIES) * 8;
 const FRAGMENT_CONSTANTS: usize = 30;
 const WRITES_DEPTH: u32 = 4;
 
@@ -236,6 +361,15 @@ const FACTORS: [u32; 15] = [
 const EQUATIONS: [u32; 5] = [glow::FUNC_ADD, glow::FUNC_SUBTRACT, glow::FUNC_REVERSE_SUBTRACT, glow::MIN, glow::MAX];
 
 const TEXTURE_KEEP_FLUSHES: u64 = 600;
+
+/// batches a surface nothing drew into or read stays for, and how often the
+/// ones past it are let go.
+const SURFACE_KEEP_FLUSHES: u64 = 600;
+const RETIRE_EVERY: u64 = 60;
+
+/// batches a surface's memory goes without being compared with its shadow
+/// while the journal says nothing wrote there.
+const SURFACE_TRUSTED_FLUSHES: u64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -268,6 +402,11 @@ struct Surface {
     packed: Option<(glow::Texture, glow::Framebuffer)>,
     version: u64,
     stale: bool,
+    /// the batch it was last drawn into or read in.
+    used: u64,
+    /// the journal's stamp when memory was last found to hold the shadow,
+    /// and the batch that was in.
+    matched: (u64, u64),
 }
 
 static VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -469,7 +608,7 @@ fn pooled<T: Send + 'static>(worker: &Worker, gl: GlRef, (pool, coming): (&mut V
     }
     if pool.len() < 32 && coming.is_none() {
         let (send, receiver) = std::sync::mpsc::channel();
-        worker.post_keeping(move || drop(send.send((0..64).filter_map(|_| make(&gl)).collect::<Vec<_>>())));
+        worker.post_now(move || drop(send.send((0..64).filter_map(|_| make(&gl)).collect::<Vec<_>>())));
         *coming = Some(receiver);
     }
     if pool.is_empty() {
@@ -478,6 +617,36 @@ fn pooled<T: Send + 'static>(worker: &Worker, gl: GlRef, (pool, coming): (&mut V
         pool.extend(names);
     }
     Ok(pool.pop().expect("a name was made"))
+}
+
+thread_local! {
+    /// what the next sync is for, so that its wait says so in the log.
+    static SYNC_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("sync") };
+}
+
+/// names what the next sync on this thread is for.
+pub(crate) fn sync_why(why: &'static str) {
+    SYNC_WHY.with(|cell| cell.set(why));
+}
+
+/// a copy or transfer of a drawing left to the CPU, which reads it back,
+/// in the log the first few times, with the drawing it reads, for telling
+/// which a game needs done on the GPU.
+fn left_to_cpu(what: &str, input: u32, len: u32, details: String, surfaces: &[Surface]) {
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(s) = surfaces.iter().find(|s| s.dirty_overlaps(input, len)) else { return };
+    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200 {
+        return;
+    }
+    log::info!(
+        "{what} left to the CPU, {len} bytes from {input:08X}, {details}; the drawing there is {:08X} {}x{} {:?} {} rows {:?}",
+        s.addr,
+        s.width,
+        s.height,
+        s.kind,
+        if s.tiled { "tiled" } else { "linear" },
+        s.dirty
+    );
 }
 
 fn wait_from(name: &'static str) {
@@ -502,29 +671,14 @@ fn report_times() {
     }
 }
 
-const MANIFEST_HEADER: &str = "zakuro-gles 4";
+const MANIFEST_HEADER: &str = "zakuro-gles 5";
 
-/// a manifest from before the texture configuration constant told which
-/// units never clamp to the border, with every unit it turns on so.
-fn upgrade_manifest(text: &str) -> String {
-    let mut out = format!("{MANIFEST_HEADER}\n");
-    for line in text.lines().skip(1) {
-        let mut fields: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
-        if let Some(config) = fields.get_mut(2 + 25) {
-            if let Ok(value) = u32::from_str_radix(config, 16) {
-                *config = format!("{:x}", value | (value & 7) << 20);
-            }
-        }
-        out += &fields.join(" ");
-        out.push('\n');
-    }
-    out
-}
-
-fn vertex_path(manifest: &std::path::Path, hash: u64) -> std::path::PathBuf {
+/// the vertex programs' words, kept by fingerprint, so a run translates
+/// them again with its own translator.
+fn vertex_path(manifest: &std::path::Path, fingerprint: u64) -> std::path::PathBuf {
     let mut dir = manifest.as_os_str().to_owned();
     dir.push(".vertex");
-    std::path::PathBuf::from(dir).join(format!("{hash:016x}.vert"))
+    std::path::PathBuf::from(dir).join(format!("{fingerprint:016x}.pica"))
 }
 
 fn manifest_path() -> Option<std::path::PathBuf> {
@@ -662,6 +816,43 @@ pub(crate) const COMPILING: &str = "its program is compiling";
 
 /// the generic fragment program's constants, which draws whatever the
 /// combination through uniforms.
+/// the registers fragment_constants reads, which the manifest keeps whole,
+/// so a later build works its own constants out from them.
+fn key_registers() -> impl Iterator<Item = usize> {
+    STAGE_REGISTERS
+        .into_iter()
+        .flat_map(|base| [base, base + 1, base + 2, base + 4])
+        .chain(TEXTURE_UNIT_BASES.map(|base| base + 2))
+        .chain([REG_UPDATE_BUFFER, REG_TEXTURE_CONFIG, REG_ALPHA_TEST, REG_COLOR_OPERATION, REG_BLEND_FUNC, REG_LOGIC_OP, REG_DEPTH_COLOR_MASK, REG_COLOR_BUFFER_WRITE])
+        .chain(crate::lighting::SHAPE_REGISTERS)
+}
+
+/// a draw's fragment program as its constants and its lighting's shape,
+/// from its registers, the units enabled, those with their alpha apart and
+/// those reading a drawing in place, how its depth goes, and its lighting
+/// as the uniform block packs it.
+fn fragment_constants(r: &[u32], enabled: u32, split: u32, sources: [bool; 3], depth_flags: u32, writes_depth: bool, lighting: Option<&[u32]>) -> ([u32; FRAGMENT_CONSTANTS], Vec<u32>) {
+    let mut constants = [0u32; FRAGMENT_CONSTANTS];
+    for (i, base) in STAGE_REGISTERS.into_iter().enumerate() {
+        constants[i] = r[base] & 0x0FFF_0FFF;
+        constants[6 + i] = r[base + 1] & 0x0077_7FFF;
+        constants[12 + i] = r[base + 2] & 0x000F_000F;
+        constants[18 + i] = r[base + 4] & 0x0003_0003;
+    }
+    // the buffer updates, and the fog's mode and which way its depth runs
+    constants[24] = r[REG_UPDATE_BUFFER] & 0x1_FF07;
+    constants[25] = ((r[REG_TEXTURE_CONFIG] & !7) | enabled) & 0x2707 | split << 24;
+    for (unit, base) in TEXTURE_UNIT_BASES.into_iter().enumerate() {
+        let config = r[base + 2];
+        let unbordered = enabled & 1 << unit != 0 && (config >> 8) & 3 != 1 && (config >> 12) & 3 != 1;
+        constants[25] |= (sources[unit] as u32) << (16 + unit) | (unbordered as u32) << (20 + unit);
+    }
+    constants[26] = lighting.is_some() as u32;
+    constants[27] = r[REG_ALPHA_TEST] & 0x71 | unused_outputs(r);
+    constants[28] = depth_flags | if writes_depth { WRITES_DEPTH } else { 0 };
+    (constants, lighting.map_or_else(Vec::new, lighting_shape))
+}
+
 fn generic_constants(constants: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CONSTANTS] {
     let mut generic = [0u32; FRAGMENT_CONSTANTS];
     generic[25] = constants[25] & 0x400;
@@ -671,8 +862,7 @@ fn generic_constants(constants: &[u32; FRAGMENT_CONSTANTS]) -> [u32; FRAGMENT_CO
     generic
 }
 
-fn lighting_shape(words: &[u32]) -> Vec<u32> {
-    let w = &words[LIGHTING_BASE..];
+fn lighting_shape(w: &[u32]) -> Vec<u32> {
     let count = w[1] as usize;
     let mut shape = Vec::with_capacity(29 + count * 2);
     shape.extend_from_slice(&w[..8]);
@@ -878,6 +1068,9 @@ fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, li
             out = out.replace(from, to);
         }
     }
+    if ADRENO.load(std::sync::atomic::Ordering::Relaxed) {
+        out = out.replace(SWITCH_COMPARE, ADRENO_COMPARE);
+    }
     out
 }
 
@@ -899,6 +1092,22 @@ void main() {
         vec2 s = size / vec2(area.zw);
         vec2 pixel = vec2(gl_FragCoord.x - float(area.x), float(area.y + area.w) - gl_FragCoord.y) - 0.5;
         vec2 start = pixel * s;
+        // more of the screen's pixels than the area's, as one drawn bigger
+        // than shown: each of the area's averages a grid of reads spread
+        // over all the screen's pixels it covers
+        if (s.x > 1.0 || s.y > 1.0) {
+            ivec2 n = ivec2(min(ceil(s), vec2(4.0)));
+            vec3 sum = vec3(0.0);
+            for (int j = 0; j < n.y; j++) {
+                for (int i = 0; i < n.x; i++) {
+                    vec2 at = clamp(start + (vec2(float(i), float(j)) + 0.5) * s / vec2(n), vec2(0.5), size - 0.5);
+                    vec2 texel = upright != 0 ? at : vec2(float(screen.y) - at.y, float(screen.z - screen.w) - at.x);
+                    sum += texture(source, texel / vec2(textureSize(source, 0))).rgb;
+                }
+            }
+            color = vec4(sum / float(n.x * n.y), 1.0);
+            return;
+        }
         vec2 first = floor(start);
         vec2 past = clamp(((pixel + 1.0) * s - first - 1.0) / s, 0.0, 1.0);
         vec2 at = clamp(mix(first + 0.5 + past, start + 0.5 * s, step(1.0, s)), vec2(0.5), size - 0.5);
@@ -994,6 +1203,119 @@ static FLIPPED_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 extern "C" fn flipped(_fd: i32, sequence: u32, seconds: u32, microseconds: u32, _data: *mut c_void) {
     FLIPPED_AT.store(sequence, std::sync::atomic::Ordering::Relaxed);
     FLIPPED_TIME.store(seconds as u64 * 1_000_000 + microseconds as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// a native window made by the program around the engine, an Android
+/// activity's, that the screens go to in place of the panel, null for none.
+static WINDOW: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// whether the window is both of a dual-screen handheld's panels stacked,
+/// as GammaOS's DualStack gives an app them, its top half on the top panel
+/// and its bottom half on the bottom one.
+static STACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// says the window set_window gives is two panels stacked, before the
+/// renderer starts: it is never turned as a portrait panel would be, and the
+/// menu goes on the top half.
+pub fn set_stacked(stacked: bool) {
+    STACKED.store(stacked, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// whether the window is two panels stacked.
+pub fn stacked() -> bool {
+    STACKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// a second native window, on a second display, that one of the screens
+/// goes to by itself, null for none, and the one the GL thread has a
+/// surface on, which set_second_window waits to see go before its window
+/// may go away.
+static SECOND_WINDOW: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static SECOND_IN_USE: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// whether the second window shows the top screen rather than the bottom.
+static SECOND_SHOWS_TOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// whether the second window's screen is stretched over all of it.
+static SECOND_STRETCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// whether the second window's screen fills all of it, out of shape, rather
+/// than keeping its shape with bars.
+pub fn set_second_stretched(stretched: bool) {
+    SECOND_STRETCHED.store(stretched, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// hands the renderer a second window, on a second display, for one of the
+/// screens by itself, or takes it back with null. Taking it back waits, a
+/// half second at most, for the GL thread to stop drawing into it, after
+/// which the caller may let the window go.
+pub fn set_second_window(window: *mut c_void) {
+    SECOND_WINDOW.store(window, std::sync::atomic::Ordering::Release);
+    if window.is_null() {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !SECOND_IN_USE.load(std::sync::atomic::Ordering::Acquire).is_null() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+/// whether there is a second window for a screen to go to.
+pub fn second_window() -> bool {
+    !SECOND_WINDOW.load(std::sync::atomic::Ordering::Acquire).is_null()
+}
+
+/// which screen the second window shows, the top one or the bottom one.
+pub fn set_second_shows_top(top: bool) {
+    SECOND_SHOWS_TOP.store(top, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// the window the panel's surface is on, which set_window waits to see go
+/// before its window may go away.
+static WINDOW_IN_USE: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// hands the renderer a native window to show the screens in, an
+/// ANativeWindow on Android, before the title is loaded, or a new one when
+/// the activity got its window back. Null takes it back while the app is
+/// away: that waits, a half second at most, for the GL thread to let go of
+/// it, which it does at its next present, after which the caller may let the
+/// window go.
+pub fn set_window(window: *mut c_void) {
+    WINDOW.store(window, std::sync::atomic::Ordering::Release);
+    if window.is_null() {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !WINDOW_IN_USE.load(std::sync::atomic::Ordering::Acquire).is_null() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+/// the panel's surface onto the window set_window gave last: the old one let
+/// go, the context current on no surface while there is no window, and a new
+/// surface made for a new window. False when that failed.
+/// SAFETY: on the GL thread, the window valid until set_window takes it back
+unsafe fn follow_window(egl: &Egl, wanted: *mut c_void) -> bool {
+    let old = egl.surface();
+    if !old.is_null() {
+        if egl.egl.MakeCurrent(egl.display, egl::NO_SURFACE, egl::NO_SURFACE, egl.context) == 0 {
+            log::warn!("could not let go of the window, 0x{:X}", egl.egl.GetError());
+            return false;
+        }
+        egl.egl.DestroySurface(egl.display, old);
+        egl.surface.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        WINDOW_IN_USE.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        log::info!("the window went");
+    }
+    if wanted.is_null() {
+        return true;
+    }
+    let surface = egl.egl.CreateWindowSurface(egl.display, egl.config, wanted as glutin_egl_sys::EGLNativeWindowType, std::ptr::null());
+    if surface.is_null() || egl.egl.MakeCurrent(egl.display, surface, surface, egl.context) == 0 {
+        log::warn!("could not show the screens in the new window, 0x{:X}", egl.egl.GetError());
+        return false;
+    }
+    egl.egl.SwapInterval(egl.display, 1);
+    egl.surface.store(surface as *mut c_void, std::sync::atomic::Ordering::Release);
+    WINDOW_IN_USE.store(wanted, std::sync::atomic::Ordering::Release);
+    log::info!("the screens went to a new window");
+    true
 }
 
 /// the panel's refresh period, and how long before its refresh the last
@@ -1166,8 +1488,21 @@ impl Kms {
 
     /// queues what the context just swapped to for the panel's next
     /// vertical blank, waiting only for a flip still queued from before.
-    fn flip(&mut self) -> Result<(), String> {
+    /// a picture goes up no sooner than as many refreshes after the last as
+    /// the game's frames between them, two at most, so none flashes by for
+    /// one refresh and a game behind is never held up further.
+    fn flip(&mut self, frames: u32) -> Result<(), String> {
         self.settle()?;
+        let period = PANEL_PERIOD.load(std::sync::atomic::Ordering::Relaxed) / 1000;
+        let mut paced = false;
+        if frames > 1 && period > 0 && self.last_flip != 0 {
+            let due = FLIPPED_TIME.load(std::sync::atomic::Ordering::Relaxed) + (frames as u64 - 1) * period + 1000;
+            let now = monotonic_micros();
+            if due > now && due - now < 4 * period {
+                std::thread::sleep(std::time::Duration::from_micros(due - now));
+                paced = true;
+            }
+        }
         // SAFETY: as in open, the buffer object is the surface's front one
         unsafe {
             let bo = call!(self.gbm, "gbm_surface_lock_front_buffer", fn(*mut c_void) -> *mut c_void, self.surface);
@@ -1217,7 +1552,8 @@ impl Kms {
                 self.set = true;
                 self.shown = Some((bo, fb));
             } else if call!(self.drm, "drmModePageFlip", fn(i32, u32, u32, u32, *mut c_void) -> i32, self.fd, self.crtc, fb, 1, std::ptr::null_mut()) == 0 {
-                self.asked = monotonic_micros();
+                // a held picture says nothing of how early pictures come
+                self.asked = if paced { 0 } else { monotonic_micros() };
                 self.pending = Some((bo, fb));
             } else {
                 call!(self.drm, "drmModeRmFB", fn(i32, u32) -> i32, self.fd, fb);
@@ -1230,12 +1566,35 @@ impl Kms {
 
 /// the size the frontend lays the screens out in, the panel's shape with
 /// its long side across, 480 tall or 640 wide: 640x480 on a 4:3 panel,
-/// 853x480 on a 16:9 one, 640x640 on a square one.
-static LAYOUT: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
+/// 853x480 on a 16:9 one, 640x640 on a square one. A window that turns
+/// with the phone changes it. Width and height packed, 0 until set.
+static LAYOUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn layout_size() -> (u32, u32) {
-    let (width, height) = *LAYOUT.get().unwrap_or(&(640, 480));
-    (width as u32, height as u32)
+    match LAYOUT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => (640, 480),
+        packed => ((packed >> 32) as u32, packed as u32),
+    }
+}
+
+/// the panel's pixels to one of the layout's, f32 bits.
+static LAYOUT_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// how many of the panel's pixels one of the layout's is, for scaling the
+/// screens by whole pixels.
+pub fn layout_scale() -> f32 {
+    match LAYOUT_SCALE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 1.0,
+        bits => f32::from_bits(bits),
+    }
+}
+
+/// lays the screens out for a panel this size, as it is seen once turned.
+fn set_layout(panel: (i32, i32)) {
+    let (width, height) = layout_for(panel);
+    LAYOUT.store((width as u64) << 32 | height as u64, std::sync::atomic::Ordering::Relaxed);
+    LAYOUT_SCALE.store((panel.0 as f32 / width as f32).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    log::info!("screens laid out in {width}x{height}");
 }
 
 fn layout_for((width, height): (i32, i32)) -> (i32, i32) {
@@ -1246,17 +1605,29 @@ fn layout_for((width, height): (i32, i32)) -> (i32, i32) {
     }
 }
 
+/// the size ZAKURO_PANEL_SHOT's panel stands in at, 640x480 unless
+/// ZAKURO_PANEL_SIZE=1920x1080 says, for a look at a bigger screen.
+fn offscreen_size() -> (i32, i32) {
+    static SIZE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let given = std::env::var("ZAKURO_PANEL_SIZE").ok();
+        given.and_then(|size| Some((size.split_once('x')?.0.parse().ok()?, size.split_once('x')?.1.parse().ok()?))).unwrap_or((640, 480))
+    })
+}
+
 /// the panel's size and the way its picture is turned, none on a landscape
 /// panel.
 fn panel_shape(output: &Output) -> ((i32, i32), Option<i32>) {
     let size = match output {
         Output::Kms(kms) => kms.size(),
         Output::Fbdev(window) => (window[0] as i32, window[1] as i32),
-        Output::Offscreen(_) => (640, 480),
+        Output::Window(size) => *size,
+        Output::Offscreen(_) => offscreen_size(),
     };
+    // a window turns with the device itself
     let turn = match output {
         Output::Kms(_) | Output::Fbdev(_) => panel_turn(size.0, size.1),
-        Output::Offscreen(_) => None,
+        Output::Window(_) | Output::Offscreen(_) => None,
     };
     (size, turn)
 }
@@ -1331,9 +1702,9 @@ void main() {
 "#;
 
 /// draws a user interface over the screens, its textures made the first time
-/// they come and kept by their id.
+/// they come and kept by their id, in space's size from where fit starts.
 /// SAFETY: on the GL thread, with the panel's framebuffer bound
-unsafe fn draw_overlay(gl: &glow::Context, panel: &mut Panel, overlay: &crate::Overlay, height: i32, fit: Fit) -> Result<(), String> {
+unsafe fn draw_overlay(gl: &glow::Context, panel: &mut Panel, overlay: &crate::Overlay, height: i32, fit: Fit, space: (i32, i32)) -> Result<(), String> {
     let (program, array, vertices, indices) = match panel.overlay {
         Some(made) => made,
         None => {
@@ -1384,10 +1755,10 @@ unsafe fn draw_overlay(gl: &glow::Context, panel: &mut Panel, overlay: &crate::O
             gl.delete_texture(texture);
         }
     }
-    let [x, y, width, tall] = fit.area([0, 0, 640, 480]);
+    let [x, y, width, tall] = fit.area([0, 0, space.0, space.1]);
     gl.viewport(x, height - y - tall, width, tall);
     gl.use_program(Some(program));
-    gl.uniform_2_f32(gl.get_uniform_location(program, "size").as_ref(), 640.0, 480.0);
+    gl.uniform_2_f32(gl.get_uniform_location(program, "size").as_ref(), space.0 as f32, space.1 as f32);
     gl.uniform_1_i32(gl.get_uniform_location(program, "source").as_ref(), 0);
     gl.bind_vertex_array(Some(array));
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertices));
@@ -1479,6 +1850,10 @@ struct Canvas {
 /// nothing, 90 turns clockwise, 270 counter clockwise, and unset turns
 /// clockwise on a portrait panel.
 fn panel_turn(width: i32, height: i32) -> Option<i32> {
+    // two landscape panels stacked are taller than wide, and are not turned
+    if stacked() {
+        return None;
+    }
     static CHOICE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let choice = CHOICE.get_or_init(|| std::env::var("ZAKURO_PANEL_ROTATE").ok());
     match choice.as_deref() {
@@ -1489,89 +1864,118 @@ fn panel_turn(width: i32, height: i32) -> Option<i32> {
     }
 }
 
-fn show(gl: GlRef, parts: Vec<Part>) -> Result<(), String> {
-    disturb();
-    PANEL.with(|panel| {
-        let mut panel = panel.borrow_mut();
-        let Some(panel) = panel.as_mut() else { return Ok(()) };
-        let program = match panel.program {
-            Some(program) => program,
-            None => {
-                let program = link(&gl, PACK_VERTEX_SOURCE, PRESENT_SOURCE)?;
-                panel.program = Some(program);
-                program
-            }
-        };
-        // SAFETY: on the GL thread, the window surface is current and every
-        // texture read is the size the uniforms say
+/// the surface on the second window set_second_window gave, made, remade
+/// or let go as the window came, changed or went, and its size.
+fn second_surface(panel: &mut Panel) -> Option<(egl::types::EGLSurface, (i32, i32))> {
+    let wanted = SECOND_WINDOW.load(std::sync::atomic::Ordering::Acquire);
+    let egl = panel.egl;
+    if panel.second.is_some_and(|(_, window, _)| window != wanted) {
+        let (surface, ..) = panel.second.take().unwrap();
+        // SAFETY: a surface this made on the display, not current
+        unsafe { egl.egl.DestroySurface(egl.display, surface) };
+        SECOND_IN_USE.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+        log::info!("the second window went");
+    }
+    if panel.second.is_none() && !wanted.is_null() {
+        // SAFETY: a window set_second_window keeps valid until it takes it
+        // back, on the display and config the panel's context has
         unsafe {
-            let empty = match panel.empty {
-                Some(empty) => empty,
-                None => {
-                    let empty = gl.create_vertex_array()?;
-                    panel.empty = Some(empty);
-                    empty
-                }
-            };
-            let ((panel_width, panel_height), turn) = panel_shape(&panel.output);
-            let panel_framebuffer = match &panel.output {
-                Output::Offscreen(framebuffer) => Some(*framebuffer),
-                _ => None,
-            };
-            // a portrait panel under a landscape layout: everything is drawn
-            // into a canvas the panel's size on its side, which is turned
-            // onto the panel at the end
-            let (width, height, framebuffer) = match turn {
-                Some(_) => {
-                    let (canvas_width, canvas_height) = (panel_height, panel_width);
-                    let canvas = match panel.canvas {
-                        Some(canvas) if (canvas.width, canvas.height) == (canvas_width, canvas_height) => canvas,
-                        _ => {
-                            let texture = gl.create_texture()?;
-                            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, canvas_width, canvas_height);
-                            let framebuffer = gl.create_framebuffer()?;
-                            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
-                            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
-                            let program = link(&gl, PACK_VERTEX_SOURCE, ROTATE_SOURCE)?;
-                            let made = Canvas { texture, framebuffer, program, width: canvas_width, height: canvas_height };
-                            panel.canvas = Some(made);
-                            log::info!("drawing a {canvas_width}x{canvas_height} picture turned onto the {panel_width}x{panel_height} panel");
-                            made
-                        }
-                    };
-                    (canvas_width, canvas_height, Some(canvas.framebuffer))
-                }
-                None => (panel_width, panel_height, panel_framebuffer),
-            };
-            let layout = *LAYOUT.get().unwrap_or(&(640, 480));
-            let fit = Fit::new(layout, (width, height));
-            gl.bind_framebuffer(glow::FRAMEBUFFER, framebuffer);
-            gl.viewport(0, 0, width, height);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::BLEND);
-            gl.disable(glow::DEPTH_TEST);
-            gl.disable(glow::STENCIL_TEST);
-            gl.disable(glow::CULL_FACE);
-            gl.color_mask(true, true, true, true);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.use_program(Some(program));
-            let linear = match panel.linear {
-                Some(linear) => linear,
-                None => {
-                    let linear = gl.create_sampler()?;
-                    for (parameter, value) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
-                        gl.sampler_parameter_i32(linear, parameter, value as i32);
-                    }
-                    panel.linear = Some(linear);
-                    linear
-                }
-            };
-            gl.bind_vertex_array(Some(empty));
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_sampler(0, None);
-            gl.uniform_1_i32(gl.get_uniform_location(program, "source").as_ref(), 0);
+            let surface = egl.egl.CreateWindowSurface(egl.display, egl.config, wanted as glutin_egl_sys::EGLNativeWindowType, std::ptr::null());
+            if surface.is_null() {
+                log::warn!("could not make a surface on the second window, 0x{:X}", egl.egl.GetError());
+                return None;
+            }
+            let (mut width, mut height) = (0, 0);
+            egl.egl.QuerySurface(egl.display, surface, egl::WIDTH as i32, &mut width);
+            egl.egl.QuerySurface(egl.display, surface, egl::HEIGHT as i32, &mut height);
+            // the panel's swap waits for its refresh already, this one need not
+            egl.egl.MakeCurrent(egl.display, surface, surface, egl.context);
+            egl.egl.SwapInterval(egl.display, 0);
+            egl.egl.MakeCurrent(egl.display, egl.surface(), egl.surface(), egl.context);
+            SECOND_IN_USE.store(wanted, std::sync::atomic::Ordering::Release);
+            log::info!("a screen goes to a {width}x{height} second window");
+            panel.second = Some((surface, wanted, (width, height)));
+        }
+    }
+    panel.second.map(|(surface, _, size)| (surface, size))
+}
+
+/// draws the second window's screen filling it, with the cursor over it,
+/// swaps it, and makes the panel's surface current again.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_second(
+    gl: &glow::Context,
+    panel: &mut Panel,
+    program: glow::Program,
+    linear: glow::Sampler,
+    empty: glow::VertexArray,
+    surface: egl::types::EGLSurface,
+    (width, height): (i32, i32),
+    parts: Vec<Part>,
+) -> Result<(), String> {
+    let egl = panel.egl;
+    if egl.egl.MakeCurrent(egl.display, surface, surface, egl.context) == 0 {
+        return Err(format!("could not make the second window current, 0x{:X}", egl.egl.GetError()));
+    }
+    // the screen's own size is the layout here, its area all of it
+    let mut layout = parts
+        .iter()
+        .find_map(|part| match part {
+            Part::Surface { area, .. } | Part::Pixels { area, .. } => Some((area[2].max(1), area[3].max(1))),
+            _ => None,
+        })
+        .unwrap_or((320, 240));
+    let mut parts = parts;
+    if SECOND_STRETCHED.load(std::sync::atomic::Ordering::Relaxed) {
+        // stretched, the window's own size is the layout, the screen all of
+        // it and the cursor moved along
+        let (across, down) = (width as f32 / layout.0 as f32, height as f32 / layout.1 as f32);
+        for part in &mut parts {
+            match part {
+                Part::Surface { area, .. } | Part::Pixels { area, .. } => *area = [0, 0, width, height],
+                Part::Cursor { x, y } => (*x, *y) = ((*x as f32 * across) as i32, (*y as f32 * down) as i32),
+                Part::Overlay(_) => {}
+            }
+        }
+        layout = (width, height);
+    }
+    let fit = Fit::new(layout, (width, height));
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    gl.viewport(0, 0, width, height);
+    gl.disable(glow::SCISSOR_TEST);
+    gl.disable(glow::BLEND);
+    gl.color_mask(true, true, true, true);
+    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    gl.use_program(Some(program));
+    gl.bind_vertex_array(Some(empty));
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_sampler(0, None);
+    gl.uniform_1_i32(gl.get_uniform_location(program, "source").as_ref(), 0);
+    let drawn = draw_parts(gl, panel, program, linear, None, height, fit, layout, parts);
+    let swapped = egl.egl.SwapBuffers(egl.display, surface) != 0;
+    egl.egl.MakeCurrent(egl.display, egl.surface(), egl.surface(), egl.context);
+    drawn?;
+    if !swapped {
+        log::warn!("could not swap the second window's buffers, 0x{:X}", egl.egl.GetError());
+    }
+    Ok(())
+}
+
+/// draws each part into the framebuffer bound, height pixels high, the
+/// layout fitted into it as fit says.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_parts(
+    gl: &glow::Context,
+    panel: &mut Panel,
+    program: glow::Program,
+    linear: glow::Sampler,
+    framebuffer: Option<glow::Framebuffer>,
+    height: i32,
+    fit: Fit,
+    layout: (i32, i32),
+    parts: Vec<Part>,
+) -> Result<(), String> {
             for part in parts {
                 let (texture, screen, upright, area, smooth) = match part {
                     Part::Cursor { x, y } => {
@@ -1601,20 +2005,28 @@ fn show(gl: GlRef, parts: Vec<Part>) -> Result<(), String> {
                             Step::Halfway => Some(1),
                         };
                         if let Some(slot) = keep {
-                            panel.between.keep(&gl, program, texture, screen, slot)?;
+                            panel.between.keep(gl, program, texture, screen, slot)?;
                             gl.bind_framebuffer(glow::FRAMEBUFFER, framebuffer);
                         }
                         if let Step::Halfway = step {
                             let gl_area = [area[0], height - area[1] - area[3], area[2], area[3]];
-                            panel.between.draw(&gl, framebuffer, gl_area, smooth.then_some(linear))?;
+                            panel.between.draw(gl, framebuffer, gl_area, smooth.then_some(linear))?;
                             gl.use_program(Some(program));
                             continue;
                         }
                         gl.use_program(Some(program));
                         (texture, screen, 0, area, smooth)
                     }
+                    Part::Overlay(overlay) if overlay.whole => {
+                        draw_overlay(gl, panel, &overlay, height, fit, layout)?;
+                        continue;
+                    }
                     Part::Overlay(overlay) => {
-                        draw_overlay(&gl, panel, &overlay, height, fit.inset((layout.0 - 640) / 2, (layout.1 - 480) / 2))?;
+                        // the menu in the middle, or on the top panel of two
+                        // stacked, or at the top of a portrait window, over the
+                        // screens and clear of the controls under them
+                        let down = if stacked() || layout.1 > layout.0 { 0 } else { (layout.1 - 480) / 2 };
+                        draw_overlay(gl, panel, &overlay, height, fit.inset((layout.0 - 640) / 2, down), (640, 480))?;
                         continue;
                     }
                     Part::Pixels { index, pixels, width, height, area, smooth } => {
@@ -1649,6 +2061,126 @@ fn show(gl: GlRef, parts: Vec<Part>) -> Result<(), String> {
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 gl.draw_arrays(glow::TRIANGLES, 0, 3);
             }
+    Ok(())
+}
+
+fn show(gl: GlRef, parts: Vec<Part>, frames: u32) -> Result<(), String> {
+    disturb();
+    PANEL.with(|panel| {
+        let mut panel = panel.borrow_mut();
+        let Some(panel) = panel.as_mut() else { return Ok(()) };
+        let program = match panel.program {
+            Some(program) => program,
+            None => {
+                let program = link(&gl, PACK_VERTEX_SOURCE, PRESENT_SOURCE)?;
+                panel.program = Some(program);
+                program
+            }
+        };
+        // SAFETY: on the GL thread, the window surface is current and every
+        // texture read is the size the uniforms say
+        unsafe {
+            let empty = match panel.empty {
+                Some(empty) => empty,
+                None => {
+                    let empty = gl.create_vertex_array()?;
+                    panel.empty = Some(empty);
+                    empty
+                }
+            };
+            if let Output::Window(_) = panel.output {
+                // the app away, or back with a new window
+                let wanted = WINDOW.load(std::sync::atomic::Ordering::Acquire);
+                if (wanted != WINDOW_IN_USE.load(std::sync::atomic::Ordering::Acquire) && !follow_window(panel.egl, wanted)) || wanted.is_null() {
+                    return Ok(());
+                }
+            }
+            if let Output::Window(size) = &mut panel.output {
+                let (mut width, mut height) = (0, 0);
+                panel.egl.egl.QuerySurface(panel.egl.display, panel.egl.surface(), egl::WIDTH as i32, &mut width);
+                panel.egl.egl.QuerySurface(panel.egl.display, panel.egl.surface(), egl::HEIGHT as i32, &mut height);
+                if width > 0 && height > 0 && (width, height) != *size {
+                    log::info!("the window is {width}x{height} now");
+                    *size = (width, height);
+                    set_layout(*size);
+                }
+            }
+            let ((panel_width, panel_height), turn) = panel_shape(&panel.output);
+            let panel_framebuffer = match &panel.output {
+                Output::Offscreen(framebuffer) => Some(*framebuffer),
+                _ => None,
+            };
+            // a portrait panel under a landscape layout: everything is drawn
+            // into a canvas the panel's size on its side, which is turned
+            // onto the panel at the end
+            let (width, height, framebuffer) = match turn {
+                Some(_) => {
+                    let (canvas_width, canvas_height) = (panel_height, panel_width);
+                    let canvas = match panel.canvas {
+                        Some(canvas) if (canvas.width, canvas.height) == (canvas_width, canvas_height) => canvas,
+                        _ => {
+                            let texture = gl.create_texture()?;
+                            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, canvas_width, canvas_height);
+                            let framebuffer = gl.create_framebuffer()?;
+                            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
+                            let program = link(&gl, PACK_VERTEX_SOURCE, ROTATE_SOURCE)?;
+                            let made = Canvas { texture, framebuffer, program, width: canvas_width, height: canvas_height };
+                            panel.canvas = Some(made);
+                            log::info!("drawing a {canvas_width}x{canvas_height} picture turned onto the {panel_width}x{panel_height} panel");
+                            made
+                        }
+                    };
+                    (canvas_width, canvas_height, Some(canvas.framebuffer))
+                }
+                None => (panel_width, panel_height, panel_framebuffer),
+            };
+            let layout = layout_size();
+            let layout = (layout.0 as i32, layout.1 as i32);
+            let fit = Fit::new(layout, (width, height));
+            gl.bind_framebuffer(glow::FRAMEBUFFER, framebuffer);
+            gl.viewport(0, 0, width, height);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::DEPTH_TEST);
+            gl.disable(glow::STENCIL_TEST);
+            gl.disable(glow::CULL_FACE);
+            gl.color_mask(true, true, true, true);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.use_program(Some(program));
+            let linear = match panel.linear {
+                Some(linear) => linear,
+                None => {
+                    let linear = gl.create_sampler()?;
+                    for (parameter, value) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+                        gl.sampler_parameter_i32(linear, parameter, value as i32);
+                    }
+                    panel.linear = Some(linear);
+                    linear
+                }
+            };
+            gl.bind_vertex_array(Some(empty));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_sampler(0, None);
+            gl.uniform_1_i32(gl.get_uniform_location(program, "source").as_ref(), 0);
+            // the screen the second window shows, and the cursor when that is
+            // the bottom one, go there; the rest to the panel
+            let second = second_surface(panel);
+            let (parts, second_parts): (Vec<Part>, Vec<Part>) = match second {
+                Some(_) => {
+                    let top = SECOND_SHOWS_TOP.load(std::sync::atomic::Ordering::Relaxed);
+                    parts.into_iter().partition(|part| match part {
+                        Part::Surface { top: is_top, .. } => *is_top != top,
+                        Part::Pixels { index, .. } => (*index == 0) != top,
+                        Part::Cursor { .. } => top,
+                        Part::Overlay(_) => true,
+                    })
+                }
+                None => (parts, Vec::new()),
+            };
+            draw_parts(&gl, panel, program, linear, framebuffer, height, fit, layout, parts)?;
             if let Output::Offscreen(_) = panel.output {
                 if let Some(path) = std::env::var_os("ZAKURO_PANEL_SHOT") {
                     let mut data = vec![0u8; (width * height * 4) as usize];
@@ -1687,13 +2219,16 @@ fn show(gl: GlRef, parts: Vec<Part>) -> Result<(), String> {
                 gl.bind_texture(glow::TEXTURE_2D, Some(canvas.texture));
                 gl.draw_arrays(glow::TRIANGLES, 0, 3);
             }
-            if panel.egl.egl.SwapBuffers(panel.egl.display, panel.egl.surface) == 0 {
+            if panel.egl.egl.SwapBuffers(panel.egl.display, panel.egl.surface()) == 0 {
                 return Err("could not swap the panel's buffers".into());
+            }
+            if let Some((surface, size)) = second {
+                draw_second(&gl, panel, program, linear, empty, surface, size, second_parts)?;
             }
         }
         match &mut panel.output {
-            Output::Kms(kms) => kms.flip(),
-            Output::Fbdev(_) | Output::Offscreen(_) => Ok(()),
+            Output::Kms(kms) => kms.flip(frames),
+            Output::Fbdev(_) | Output::Window(_) | Output::Offscreen(_) => Ok(()),
         }
     })
 }
@@ -1706,6 +2241,8 @@ enum Output {
     /// the framebuffer device's size, the window a Mali driver built for
     /// it takes, kept where EGL was given it.
     Fbdev(Box<[u16; 2]>),
+    /// a window set_window was given, its size.
+    Window((i32, i32)),
     Offscreen(glow::Framebuffer),
 }
 
@@ -1723,6 +2260,8 @@ struct Panel {
     between: Between,
     /// the landscape canvas a portrait panel's picture is drawn into first.
     canvas: Option<Canvas>,
+    /// the surface on the second window, the window and its size.
+    second: Option<(egl::types::EGLSurface, *mut c_void, (i32, i32))>,
 }
 
 thread_local! {
@@ -1735,7 +2274,9 @@ struct Egl {
     display: egl::types::EGLDisplay,
     config: egl::types::EGLConfig,
     context: egl::types::EGLContext,
-    surface: egl::types::EGLSurface,
+    /// the panel's surface, which an activity's window going and coming
+    /// back changes.
+    surface: std::sync::atomic::AtomicPtr<c_void>,
 }
 
 // SAFETY: EGL's entry points can be called from any thread, and the handles
@@ -1825,6 +2366,10 @@ fn gbm_display(loaded: &egl::Egl) -> Option<egl::types::EGLDisplay> {
 }
 
 impl Egl {
+    fn surface(&self) -> egl::types::EGLSurface {
+        self.surface.load(std::sync::atomic::Ordering::Acquire) as egl::types::EGLSurface
+    }
+
     fn new() -> Result<(Egl, glow::Context), String> {
         let library = open(&["libEGL.so.1", "libEGL.so"]).map_err(|why| format!("could not load libEGL, {why}"))?;
         let gles = open(&["libGLESv2.so.2", "libGLESv2.so"]).ok();
@@ -1882,7 +2427,7 @@ impl Egl {
                 let Ok(c_name) = CString::new(name) else { return std::ptr::null() };
                 remember(name, loaded.GetProcAddress(c_name.as_ptr()) as *const c_void)
             });
-            Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface }, gl))
+            Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void) }, gl))
         }
     }
 
@@ -2003,6 +2548,64 @@ impl Egl {
         }
     }
 
+    /// a context drawing into a native window set_window was given, and the
+    /// window's size.
+    fn new_window(window: *mut c_void) -> Result<(Egl, glow::Context, (i32, i32)), String> {
+        // SAFETY: as in new, and the window stays valid as set_window asks
+        unsafe {
+            let library = open(&["libEGL.so.1", "libEGL.so"]).map_err(|why| format!("could not load libEGL, {why}"))?;
+            let gles = open(&["libGLESv2.so.2", "libGLESv2.so"]).ok();
+            let loaded = egl::Egl::load_with(|name| symbol(&library, name));
+            let display = loaded.GetDisplay(egl::DEFAULT_DISPLAY);
+            let (mut major, mut minor) = (0, 0);
+            if display.is_null() || loaded.Initialize(display, &mut major, &mut minor) == 0 {
+                return Err(format!("could not initialize EGL for the window, 0x{:X}", loaded.GetError()));
+            }
+            loaded.BindAPI(egl::OPENGL_ES_API);
+            let attributes = [
+                egl::RENDERABLE_TYPE as i32,
+                egl::OPENGL_ES3_BIT as i32,
+                egl::SURFACE_TYPE as i32,
+                egl::WINDOW_BIT as i32,
+                egl::RED_SIZE as i32,
+                8,
+                egl::GREEN_SIZE as i32,
+                8,
+                egl::BLUE_SIZE as i32,
+                8,
+                egl::ALPHA_SIZE as i32,
+                0,
+                egl::DEPTH_SIZE as i32,
+                0,
+                egl::NONE as i32,
+            ];
+            let mut configs = [std::ptr::null(); 64];
+            let mut count = 0;
+            if loaded.ChooseConfig(display, attributes.as_ptr(), configs.as_mut_ptr(), 64, &mut count) == 0 || count <= 0 {
+                return Err("no EGL config for the window".into());
+            }
+            // the first config with exactly eight bits a channel and no alpha,
+            // which the window's buffers take without a conversion
+            let exact = configs[..count as usize].iter().copied().find(|&config| {
+                let size = |attribute: u32| {
+                    let mut value = 0;
+                    loaded.GetConfigAttrib(display, config, attribute as i32, &mut value);
+                    value
+                };
+                [size(egl::RED_SIZE), size(egl::GREEN_SIZE), size(egl::BLUE_SIZE), size(egl::ALPHA_SIZE)] == [8, 8, 8, 0]
+            });
+            let config = exact.unwrap_or(configs[0]);
+            let (egl, gl) = Egl::on_window((library, gles), loaded, display, config, window as glutin_egl_sys::EGLNativeWindowType, 1)?;
+            let (mut width, mut height) = (0, 0);
+            egl.egl.QuerySurface(egl.display, egl.surface(), egl::WIDTH as i32, &mut width);
+            egl.egl.QuerySurface(egl.display, egl.surface(), egl::HEIGHT as i32, &mut height);
+            if width <= 0 || height <= 0 {
+                return Err(format!("the window has no size, {width}x{height}"));
+            }
+            Ok((egl, gl, (width, height)))
+        }
+    }
+
     /// an OpenGL ES 3.1 context drawing to a window, swapping its buffers
     /// interval refreshes apart.
     unsafe fn on_window(
@@ -2034,7 +2637,7 @@ impl Egl {
             let Ok(c_name) = CString::new(name) else { return std::ptr::null() };
             remember(name, loaded.GetProcAddress(c_name.as_ptr()) as *const c_void)
         });
-        Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface }, gl))
+        Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void) }, gl))
     }
 
     /// a context sharing this one's objects, made current on the calling
@@ -2073,6 +2676,13 @@ impl Egl {
     }
 
     fn new_with_panel() -> Result<(Egl, glow::Context, Option<Output>), String> {
+        let window = WINDOW.load(std::sync::atomic::Ordering::Acquire);
+        if !window.is_null() {
+            let (egl, gl, size) = Egl::new_window(window)?;
+            WINDOW_IN_USE.store(window, std::sync::atomic::Ordering::Release);
+            log::info!("the screens go to a {}x{} window", size.0, size.1);
+            return Ok((egl, gl, Some(Output::Window(size))));
+        }
         if std::env::var_os("ZAKURO_KMS").is_some() {
             return match Egl::new_kms() {
                 Ok((egl, gl, kms)) => Ok((egl, gl, Some(Output::Kms(kms)))),
@@ -2100,12 +2710,14 @@ struct Cached {
     depth: Option<Option<u32>>,
     depth_mask: Option<bool>,
     stencil: Option<Option<(u32, u32, u32)>>,
-    units: [Option<(glow::Texture, Option<glow::Sampler>)>; 3],
+    units: [Option<(glow::Texture, Option<glow::Sampler>)>; 6],
     tables_bound: Option<usize>,
     viewport: Option<[i32; 4]>,
     cull: Option<u32>,
     vertex_array: Option<glow::VertexArray>,
     stride: Option<usize>,
+    /// the resident arrays the shaded vertex array reads and how.
+    resident: Option<(Vec<usize>, Vec<(usize, Attribute)>)>,
     uniforms: Vec<u32>,
     shading: Vec<u32>,
 }
@@ -2116,18 +2728,41 @@ struct Ring {
     offset: usize,
     align: usize,
     laps: u64,
+    /// the whole buffer mapped for good, where the driver has buffer
+    /// storage, written with no call into GL, and a fence after each
+    /// quarter, waited on before that quarter is written again: Adreno's
+    /// driver waits for the GPU on every map or update of a buffer in use
+    mapped: Option<(*mut u8, [Option<glow::Fence>; 4])>,
+}
+
+/// whether rings are mapped for good: on Android, or with
+/// ZAKURO_PERSISTENT, where the driver has buffer storage.
+fn persistent(gl: &glow::Context) -> bool {
+    static PERSISTENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PERSISTENT.get_or_init(|| {
+        (cfg!(target_os = "android") || std::env::var_os("ZAKURO_PERSISTENT").is_some()) && gl.supported_extensions().contains("GL_EXT_buffer_storage")
+    })
 }
 
 impl Ring {
     fn new(gl: &glow::Context, target: u32, size: usize, align: usize) -> Result<Ring, String> {
-        // SAFETY: the context is current
-        let buffer = unsafe {
+        // SAFETY: the context is current, and the mapping lasts as long as
+        // the buffer, which a ring keeps
+        unsafe {
             let buffer = gl.create_buffer()?;
             gl.bind_buffer(target, Some(buffer));
+            if persistent(gl) {
+                let flags = glow::MAP_WRITE_BIT | glow::MAP_PERSISTENT_BIT | glow::MAP_COHERENT_BIT;
+                gl.buffer_storage(target, size as i32, None, flags);
+                let base = gl.map_buffer_range(target, 0, size as i32, flags);
+                if base.is_null() {
+                    return Err("could not map a buffer for good".into());
+                }
+                return Ok(Ring { buffer, size, offset: 0, align, laps: 0, mapped: Some((base, Default::default())) });
+            }
             gl.buffer_data_size(target, size as i32, glow::STREAM_DRAW);
-            buffer
-        };
-        Ok(Ring { buffer, size, offset: 0, align, laps: 0 })
+            Ok(Ring { buffer, size, offset: 0, align, laps: 0, mapped: None })
+        }
     }
 
     fn push(&mut self, gl: &glow::Context, target: u32, bytes: &[u8]) -> Result<usize, String> {
@@ -2137,6 +2772,39 @@ impl Ring {
     fn push_aligned(&mut self, gl: &glow::Context, target: u32, bytes: &[u8], align: usize) -> Result<usize, String> {
         let _timed = timed(17);
         let mut at = self.offset.div_ceil(align) * align;
+        if let Some((base, fences)) = &mut self.mapped {
+            let quarter = self.size / 4;
+            if bytes.is_empty() || bytes.len() > quarter {
+                return Err(format!("{} bytes for a ring of {}", bytes.len(), self.size));
+            }
+            // each push inside one quarter, the next one over when it would
+            // run across, so that a quarter's fence follows every draw of it
+            if at / quarter != (at + bytes.len() - 1) / quarter {
+                at = (at / quarter + 1) * quarter;
+            }
+            if at + bytes.len() > self.size {
+                at = 0;
+                self.laps += 1;
+            }
+            let (open, next) = (self.offset.saturating_sub(1) / quarter, at / quarter);
+            // SAFETY: the context is current, the quarter written is one the
+            // GPU is done with, and the range lies inside the mapping
+            unsafe {
+                if next != open {
+                    if let Some(old) = fences[open].replace(gl.fence_sync(glow::SYNC_GPU_COMMANDS_COMPLETE, 0)?) {
+                        gl.delete_sync(old);
+                    }
+                    if let Some(fence) = fences[next].take() {
+                        while gl.client_wait_sync(fence, glow::SYNC_FLUSH_COMMANDS_BIT, 100_000_000) == glow::TIMEOUT_EXPIRED {}
+                        gl.delete_sync(fence);
+                    }
+                }
+                gl.bind_buffer(target, Some(self.buffer));
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(at), bytes.len());
+            }
+            self.offset = at + bytes.len();
+            return Ok(at);
+        }
         // SAFETY: the context is current, the range mapped lies inside the
         // buffer and past everything a draw before it reads, or in storage
         // orphaned for it
@@ -2165,10 +2833,13 @@ impl Ring {
 
 struct Texture {
     texture: glow::Texture,
-    _texels: (Arc<[[u8; 4]]>, Option<Arc<[u8]>>),
+    /// ETC1A4's alpha, which ETC1 leaves out.
+    alpha: Option<glow::Texture>,
+    _texels: (Arc<[[u8; 4]]>, Option<crate::raster::Packed>),
     used: u64,
 }
 
+#[derive(PartialEq)]
 enum Attribute {
     Constant([f32; 4]),
     Array { offset: usize, ty: u32, count: u32, stride: u32 },
@@ -2236,6 +2907,39 @@ impl Resident {
     }
 }
 
+/// buffers the GPU thread fills for a draw, handed back once the GL thread
+/// has sent them on rather than freed there: glibc frees a buffer made on
+/// another thread through its arena's lock, and the two threads spent about
+/// a fifth of their time making and freeing them.
+struct Pool<T>(std::sync::Mutex<Vec<Vec<T>>>);
+
+impl<T> Pool<T> {
+    const fn new() -> Self {
+        Pool(std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn take(&self, capacity: usize) -> Vec<T> {
+        let mut buffer = self.0.lock().unwrap().pop().unwrap_or_default();
+        buffer.reserve(capacity);
+        buffer
+    }
+
+    fn give(&self, mut buffer: Vec<T>) {
+        // a big one goes, rather than stay held
+        if buffer.capacity() == 0 || buffer.capacity() * std::mem::size_of::<T>() > 1 << 20 {
+            return;
+        }
+        buffer.clear();
+        let mut pool = self.0.lock().unwrap();
+        if pool.len() < 64 {
+            pool.push(buffer);
+        }
+    }
+}
+
+static WORDS: Pool<u32> = Pool::new();
+static BYTES: Pool<u8> = Pool::new();
+
 enum Submit {
     Triangles { viewport: [i32; 4], vertices: Vec<u8>, count: i32 },
     Shaded { viewport: [i32; 4], cull: u32, uniforms: Vec<u32>, attributes: Attributes, indices: Vec<u8>, count: i32, range: (u32, u32), resident_indices: Option<Arc<[u8]>> },
@@ -2253,22 +2957,49 @@ struct DrawJob {
     depth: Option<u32>,
     depth_mask: bool,
     stencil: Option<(u32, u32, bool)>,
-    bound: [(glow::Texture, Option<glow::Sampler>); 3],
+    /// the units' textures, then ETC1A4's alphas.
+    bound: [(glow::Texture, Option<glow::Sampler>); 6],
     uniforms: Vec<u32>,
     vertex_array: glow::VertexArray,
     shaded_array: glow::VertexArray,
     geometry: Submit,
     targets: [Option<glow::Texture>; 2],
     sources: [Option<glow::Texture>; 3],
+    tables: Option<(u64, Arc<[u8]>)>,
 }
 
 impl DrawJob {
+    fn submit_logged(self, gl: GlRef) {
+        if let Err(error) = self.submit(gl) {
+            if super::first_time(&error) {
+                log::error!("the GPU could not draw, {error}");
+            }
+        }
+    }
+
     fn submit(self, gl: GlRef) -> Result<(), String> {
         let _timed_gl = timed(9);
         for source in self.sources.into_iter().flatten() {
             flush_clears(Some(source));
         }
         local(|local| {
+            // the GL thread puts them past what the draws before still read,
+            // this draw and those after bind them there
+            if let Some((id, bytes)) = &self.tables {
+                match local.table_sets.get(id).filter(|(laps, _)| *laps == local.tables.laps) {
+                    Some(&(_, at)) => local.tables_at = Some(at),
+                    None => match local.tables.push(&gl, glow::SHADER_STORAGE_BUFFER, bytes) {
+                        Ok(at) => {
+                            local.tables_at = Some(at);
+                            if local.table_sets.len() > 1024 {
+                                local.table_sets.clear();
+                            }
+                            local.table_sets.insert(*id, (local.tables.laps, at));
+                        }
+                        Err(error) => log::error!("could not upload the lighting tables, {error}"),
+                    },
+                }
+            }
             // SAFETY: on the GL thread
             let query = match self.occlusion {
                 Some((key, picture)) => match unsafe { local.occlusion.check(&gl, key, picture) } {
@@ -2296,7 +3027,10 @@ impl DrawJob {
                 cleared = true;
             }
             if std::mem::take(&mut local.disturbed) || cleared {
-                local.cache = Cached::default();
+                // what only draws set stays: the uniform blocks and tables
+                // they bound and the shaded vertex array's attributes
+                let old = std::mem::take(&mut local.cache);
+                local.cache = Cached { uniforms: old.uniforms, shading: old.shading, tables_bound: old.tables_bound, stride: old.stride, resident: old.resident, ..Cached::default() };
                 if cleared {
                     local.cache.framebuffer = Some(self.framebuffer);
                 }
@@ -2384,7 +3118,9 @@ impl DrawJob {
                 if cache.uniforms != self.uniforms {
                     let offset = local.uniforms.push(&gl, glow::UNIFORM_BUFFER, word_bytes(&self.uniforms))?;
                     gl.bind_buffer_range(glow::UNIFORM_BUFFER, 3, Some(local.uniforms.buffer), offset as i32, self.uniforms.len() as i32 * 4);
-                    local.cache.uniforms = self.uniforms;
+                    WORDS.give(std::mem::replace(&mut local.cache.uniforms, self.uniforms));
+                } else {
+                    WORDS.give(self.uniforms);
                 }
                 if let Some(at) = local.tables_at.filter(|&at| local.cache.tables_bound != Some(at)) {
                     gl.bind_buffer_range(glow::SHADER_STORAGE_BUFFER, 4, Some(local.tables.buffer), at as i32, TABLES_SIZE as i32);
@@ -2406,6 +3142,7 @@ impl DrawJob {
                             cache.vertex_array = Some(self.vertex_array);
                         }
                         let offset = local.vertices.push(&gl, glow::ARRAY_BUFFER, &vertices)?;
+                        BYTES.give(vertices);
                         gl.draw_arrays(glow::TRIANGLES, (offset / VERTEX_SIZE) as i32, count);
                     }
                     Submit::Shaded { viewport, cull, uniforms, attributes, indices, count, range, resident_indices } => {
@@ -2427,7 +3164,9 @@ impl DrawJob {
                         if cache.shading != uniforms {
                             let offset = local.shading.push(&gl, glow::UNIFORM_BUFFER, word_bytes(&uniforms))?;
                             gl.bind_buffer_range(glow::UNIFORM_BUFFER, 6, Some(local.shading.buffer), offset as i32, uniforms.len() as i32 * 4);
-                            local.cache.shading = uniforms;
+                            WORDS.give(std::mem::replace(&mut local.cache.shading, uniforms));
+                        } else {
+                            WORDS.give(uniforms);
                         }
                         let cache = &mut local.cache;
                         if cache.vertex_array != Some(self.shaded_array) {
@@ -2437,6 +3176,7 @@ impl DrawJob {
                         let base_vertex = match attributes {
                             Attributes::Fetched { bytes, slots } => {
                                 let at = local.inputs.push_aligned(&gl, glow::ARRAY_BUFFER, &bytes, 16)?;
+                                BYTES.give(bytes);
                                 for (slot, attribute) in slots.iter().enumerate() {
                                     let slot = slot as u32;
                                     match *attribute {
@@ -2454,36 +3194,44 @@ impl DrawJob {
                                 for slot in slots.len() as u32..16 {
                                     gl.disable_vertex_attrib_array(slot);
                                 }
-                                local.cache.stride = None;
+                                (local.cache.stride, local.cache.resident) = (None, None);
                                 0
                             }
                             Attributes::Resident { arrays, slots } => {
                                 local.resident.draws += 1;
-                                let buffers = arrays.iter().map(|array| local.resident.buffer(&gl, array)).collect::<Result<Vec<_>, String>>()?;
-                                for (slot, (array, attribute)) in slots.iter().enumerate() {
-                                    let slot = slot as u32;
-                                    match *attribute {
-                                        Attribute::Array { offset, ty, count, stride } => {
-                                            let kind = [glow::BYTE, glow::UNSIGNED_BYTE, glow::SHORT, glow::FLOAT][(ty & 3) as usize];
-                                            gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffers[*array]));
-                                            gl.enable_vertex_attrib_array(slot);
-                                            gl.vertex_attrib_pointer_f32(slot, count as i32, kind, false, stride as i32, offset as i32);
-                                        }
-                                        Attribute::Constant(value) => {
-                                            gl.disable_vertex_attrib_array(slot);
-                                            gl.vertex_attrib_4_f32(slot, value[0], value[1], value[2], value[3]);
+                                // the draw before's arrays read the same way,
+                                // the vertex array still has them
+                                let key: Vec<usize> = arrays.iter().map(|array| Arc::as_ptr(array) as *const u8 as usize).collect();
+                                if !local.cache.resident.as_ref().is_some_and(|(last, read)| *last == key && *read == slots) {
+                                    let buffers = arrays.iter().map(|array| local.resident.buffer(&gl, array)).collect::<Result<Vec<_>, String>>()?;
+                                    for (slot, (array, attribute)) in slots.iter().enumerate() {
+                                        let slot = slot as u32;
+                                        match *attribute {
+                                            Attribute::Array { offset, ty, count, stride } => {
+                                                let kind = [glow::BYTE, glow::UNSIGNED_BYTE, glow::SHORT, glow::FLOAT][(ty & 3) as usize];
+                                                gl.bind_buffer(glow::ARRAY_BUFFER, Some(buffers[*array]));
+                                                gl.enable_vertex_attrib_array(slot);
+                                                gl.vertex_attrib_pointer_f32(slot, count as i32, kind, false, stride as i32, offset as i32);
+                                            }
+                                            Attribute::Constant(value) => {
+                                                gl.disable_vertex_attrib_array(slot);
+                                                gl.vertex_attrib_4_f32(slot, value[0], value[1], value[2], value[3]);
+                                            }
                                         }
                                     }
+                                    for slot in slots.len() as u32..16 {
+                                        gl.disable_vertex_attrib_array(slot);
+                                    }
+                                    local.cache.stride = None;
+                                    local.cache.resident = Some((key, slots));
                                 }
-                                for slot in slots.len() as u32..16 {
-                                    gl.disable_vertex_attrib_array(slot);
-                                }
-                                local.cache.stride = None;
                                 0
                             }
                             Attributes::Packed { bytes, stride } => {
                                 let vertex_bytes = stride.max(1) * 16;
                                 let offset = local.inputs.push_aligned(&gl, glow::ARRAY_BUFFER, &bytes, vertex_bytes)?;
+                                BYTES.give(bytes);
+                                local.cache.resident = None;
                                 if local.cache.stride != Some(stride) {
                                     for slot in 0..16u32 {
                                         if (slot as usize) < stride {
@@ -2507,7 +3255,9 @@ impl DrawJob {
                             }
                             None => {
                                 let kind = if indices.len() == count as usize * 2 { glow::UNSIGNED_SHORT } else { glow::UNSIGNED_INT };
-                                (local.indices.push(&gl, glow::ELEMENT_ARRAY_BUFFER, &indices)?, kind)
+                                let offset = local.indices.push(&gl, glow::ELEMENT_ARRAY_BUFFER, &indices)?;
+                                BYTES.give(indices);
+                                (offset, kind)
                             }
                         };
                         let called = timed(18);
@@ -2850,6 +3600,7 @@ struct Compile {
 /// driver's compiler.
 struct Compiler {
     jobs: std::sync::mpsc::Sender<Compile>,
+    thread: thread::JoinHandle<()>,
     done: std::sync::mpsc::Receiver<(ProgramKey, Result<glow::Program, String>)>,
     pending: rustc_hash::FxHashSet<ProgramKey>,
     failed: rustc_hash::FxHashMap<ProgramKey, String>,
@@ -2863,7 +3614,7 @@ impl Compiler {
         let (jobs, received) = std::sync::mpsc::channel::<Compile>();
         let (finished, done) = std::sync::mpsc::channel();
         let (ready, started) = std::sync::mpsc::channel();
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("gles-compiler".into())
             .spawn(move || {
                 let Some(gl) = egl.shared_context() else {
@@ -2884,7 +3635,7 @@ impl Compiler {
                 }
             })
             .ok()?;
-        started.recv().unwrap_or(false).then(|| Compiler { jobs, done, pending: Default::default(), failed: Default::default() })
+        started.recv().unwrap_or(false).then(|| Compiler { jobs, thread, done, pending: Default::default(), failed: Default::default() })
     }
 }
 
@@ -2898,8 +3649,17 @@ struct Worker {
     jobs: std::sync::mpsc::Sender<(bool, Job)>,
     thread: ThreadId,
     /// draws waiting to go over together, one wakeup for many
-    held: std::sync::Mutex<Vec<Job>>,
+    held: std::sync::Mutex<Vec<Held>>,
 }
+
+/// a draw, or work between draws.
+enum Held {
+    Draw(DrawJob, GlRef),
+    Job(Job),
+}
+
+/// the lists of draws sent over, handed back empty to be filled again.
+static DRAWN: Pool<Held> = Pool::new();
 
 impl Worker {
     fn start() -> Result<(Worker, GlRef, Option<Compiler>), String> {
@@ -2916,7 +3676,8 @@ impl Worker {
                         None if std::env::var_os("ZAKURO_PANEL_SHOT").is_some() => unsafe {
                             let image = gl.create_renderbuffer().expect("a renderbuffer for the panel");
                             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(image));
-                            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::RGBA8, 640, 480);
+                            let (width, height) = offscreen_size();
+                            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::RGBA8, width, height);
                             let framebuffer = gl.create_framebuffer().expect("a framebuffer for the panel");
                             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
                             gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::RENDERBUFFER, Some(image));
@@ -2926,10 +3687,8 @@ impl Worker {
                     };
                     if let Some(output) = output {
                         let ((width, height), turn) = panel_shape(&output);
-                        let layout = layout_for(if turn.is_some() { (height, width) } else { (width, height) });
-                        let _ = LAYOUT.set(layout);
-                        log::info!("screens laid out in {}x{}", layout.0, layout.1);
-                        PANEL.with(|screen| *screen.borrow_mut() = Some(Panel { egl, output, program: None, textures: [None, None], empty: None, linear: None, overlay: None, overlay_textures: HashMap::new(), between: Between::default(), canvas: None }));
+                        set_layout(if turn.is_some() { (height, width) } else { (width, height) });
+                        PANEL.with(|screen| *screen.borrow_mut() = Some(Panel { egl, output, program: None, textures: [None, None], empty: None, linear: None, overlay: None, overlay_textures: HashMap::new(), between: Between::default(), canvas: None, second: None }));
                     }
                     let gl: &'static glow::Context = Box::leak(Box::new(gl));
                     GL_CONTEXT.set(Some(gl));
@@ -2954,18 +3713,25 @@ impl Worker {
         thread::current().id() == self.thread
     }
 
-    fn post(&self, job: impl FnOnce() + Send + 'static) {
+    /// posts work that touches no surface, the clears left for draws stay,
+    /// in among the draws held when there are some rather than sending them
+    /// off short.
+    fn post_keeping(&self, job: impl FnOnce() + Send + 'static) {
         if self.here() {
-            flush_clears(None);
             job();
+            return;
+        }
+        let held = self.held.lock().unwrap();
+        if held.is_empty() {
+            drop(held);
+            self.jobs.send((true, Box::new(job))).expect("the GL thread stopped");
         } else {
-            self.flush();
-            self.jobs.send((false, Box::new(job))).expect("the GL thread stopped");
+            self.hold(held, Held::Job(Box::new(job)));
         }
     }
 
-    /// posts work that touches no surface, the clears left for draws stay.
-    fn post_keeping(&self, job: impl FnOnce() + Send + 'static) {
+    /// posts work something waits on, the draws held going first.
+    fn post_now(&self, job: impl FnOnce() + Send + 'static) {
         if self.here() {
             job();
         } else {
@@ -2975,13 +3741,19 @@ impl Worker {
     }
 
     /// a draw, held to go with the next few.
-    fn post_draw(&self, job: impl FnOnce() + Send + 'static) {
+    fn post_draw(&self, job: DrawJob, gl: GlRef) {
         if self.here() {
-            job();
+            job.submit_logged(gl);
             return;
         }
-        let mut held = self.held.lock().unwrap();
-        held.push(Box::new(job));
+        self.hold(self.held.lock().unwrap(), Held::Draw(job, gl));
+    }
+
+    fn hold(&self, mut held: std::sync::MutexGuard<Vec<Held>>, item: Held) {
+        if held.capacity() == 0 {
+            *held = DRAWN.take(16);
+        }
+        held.push(item);
         if held.len() >= 16 {
             let draws = std::mem::take(&mut *held);
             drop(held);
@@ -2996,13 +3768,36 @@ impl Worker {
         }
     }
 
-    fn send_draws(&self, draws: Vec<Job>) {
-        self.jobs.send((true, Box::new(move || draws.into_iter().for_each(|draw| draw())))).expect("the GL thread stopped");
+    fn send_draws(&self, mut draws: Vec<Held>) {
+        self.jobs
+            .send((
+                true,
+                Box::new(move || {
+                    draws.drain(..).for_each(|held| match held {
+                        Held::Draw(draw, gl) => draw.submit_logged(gl),
+                        Held::Job(job) => job(),
+                    });
+                    DRAWN.give(draws);
+                }),
+            ))
+            .expect("the GL thread stopped");
     }
 
     fn run<R>(&self, job: impl FnOnce() -> R) -> R {
+        self.run_with(false, job)
+    }
+
+    /// run for work that touches no surface but those whose clears it sees to
+    /// itself, the clears left for draws stay.
+    fn run_keeping<R>(&self, job: impl FnOnce() -> R) -> R {
+        self.run_with(true, job)
+    }
+
+    fn run_with<R>(&self, keeps_clears: bool, job: impl FnOnce() -> R) -> R {
         if self.here() {
-            flush_clears(None);
+            if !keeps_clears {
+                flush_clears(None);
+            }
             return job();
         }
         let (done, result) = std::sync::mpsc::sync_channel(1);
@@ -3016,7 +3811,7 @@ impl Worker {
         let wrapped: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + '_>, Box<dyn FnOnce() + Send + 'static>>(wrapped) };
         let _timed = timed(20);
         self.flush();
-        self.jobs.send((false, wrapped)).expect("the GL thread stopped");
+        self.jobs.send((keeps_clears, wrapped)).expect("the GL thread stopped");
         result.recv().expect("the GL thread stopped").0
     }
 }
@@ -3031,12 +3826,18 @@ pub struct Gles {
     shades: bool,
     translated: rustc_hash::FxHashMap<(u64, u32, [u32; SEMANTICS]), Option<u64>>,
     vertex_sources: HashMap<u64, String>,
+    /// what each translation came from, for the manifest.
+    vertex_inputs: HashMap<u64, (u64, u32, [u32; SEMANTICS])>,
+    /// what each program being made came from, for the manifest.
+    inputs: HashMap<ProgramKey, String>,
     shaded_array: glow::VertexArray,
     generic: bool,
     vertex_array: glow::VertexArray,
-    tables: Option<(u64, u64)>,
+    tables: Option<(u64, u64, u64)>,
+    /// tables changed since the last draw went, they go with the next.
+    tables_due: Option<(u64, Arc<[u8]>)>,
     table_hashes: [(u64, u64); 24],
-    table_sets: rustc_hash::FxHashMap<[u64; 25], (u64, Arc<[u8]>)>,
+    table_sets: rustc_hash::FxHashMap<[u64; 26], (u64, Arc<[u8]>)>,
     table_set_ids: u64,
     texture_names: Vec<glow::Texture>,
     names_coming: Option<std::sync::mpsc::Receiver<Vec<glow::Texture>>>,
@@ -3050,16 +3851,30 @@ pub struct Gles {
     samplers: rustc_hash::FxHashMap<(bool, Wrap, Wrap), glow::Sampler>,
     blank: glow::Texture,
     transfer: Option<glow::Program>,
+    reinterpreter: Option<glow::Program>,
+    /// the last draw's colour words and program and what they came from.
+    fragment: Option<((u64, u32, [bool; 3], bool, bool, u64), Vec<u32>, glow::Program)>,
     upright: Option<glow::Program>,
     packers: Option<(glow::Program, glow::Program, glow::VertexArray)>,
     copiers: Option<([glow::Program; 3], glow::VertexArray)>,
     copies: rustc_hash::FxHashMap<DrawnTexture, (glow::Texture, glow::Framebuffer)>,
     copied: rustc_hash::FxHashMap<DrawnTexture, (glow::Texture, u64, u32)>,
+    /// the memory rows a texture over a drawing last had, to upload them
+    /// again only when they change.
+    over_drawing: rustc_hash::FxHashMap<DrawnTexture, Vec<u8>>,
     flushes: u64,
+    /// the batch surfaces left unused are next looked for.
+    retire_at: u64,
     /// display transfers so far, the clock occlusion culling keeps time by.
     pictures: u64,
     warned_logic_op: bool,
     preloading: bool,
+    /// the console's resolution times this over 4 is what the surfaces are
+    /// drawn at, 4 native.
+    quarters: u32,
+    /// textures and framebuffers the console's size, by depth or not and
+    /// size, which a surface drawn bigger goes through to and from memory.
+    natives: rustc_hash::FxHashMap<(bool, u32, u32), (glow::Texture, glow::Framebuffer)>,
 }
 
 impl Gles {
@@ -3102,6 +3917,7 @@ impl Gles {
             gl.disable(glow::CULL_FACE);
             gl.disable(glow::DITHER);
             log::info!("drawing with OpenGL ES on {name}");
+            ADRENO.store(name.contains("Adreno"), std::sync::atomic::Ordering::Relaxed);
             if gl.supported_extensions().contains("GL_OES_compressed_ETC1_RGB8_texture") && !crate::switch("ZAKURO_NO_ETC1", "ETC1 textures decoded") {
                 crate::raster::SAMPLES_ETC1.store(true, std::sync::atomic::Ordering::Relaxed);
                 log::info!("ETC1 textures stay compressed");
@@ -3119,10 +3935,13 @@ impl Gles {
                 shades,
                 translated: Default::default(),
                 vertex_sources: HashMap::new(),
+                vertex_inputs: HashMap::new(),
+                inputs: HashMap::new(),
                 shaded_array,
                 generic: crate::switch("ZAKURO_GENERIC_SHADERS", "generic shaders"),
                 vertex_array,
                 tables: None,
+                tables_due: None,
                 table_hashes: [(u64::MAX, 0); 24],
                 table_sets: Default::default(),
                 table_set_ids: 0,
@@ -3138,15 +3957,21 @@ impl Gles {
                 samplers: Default::default(),
                 blank,
                 transfer: None,
+                reinterpreter: None,
+                fragment: None,
                 upright: None,
                 packers: None,
                 copiers: None,
                 copies: Default::default(),
                 copied: Default::default(),
+                over_drawing: Default::default(),
                 flushes: 0,
+                retire_at: RETIRE_EVERY,
                 pictures: 0,
                 warned_logic_op: false,
                 preloading: false,
+                quarters: 4,
+                natives: Default::default(),
             };
             gles.preload();
             gles.prepare_stand_ins();
@@ -3164,7 +3989,7 @@ impl Gles {
                     constants[25] = unbordered;
                     constants[26] = lighting;
                     constants[28] = if writes_depth { WRITES_DEPTH } else { 0 };
-                    let _ = self.program(&generic_constants(&constants), writes_depth, &[], 0, false);
+                    let _ = self.program(&generic_constants(&constants), writes_depth, &[], 0, false, None);
                 }
             }
         }
@@ -3172,42 +3997,56 @@ impl Gles {
 
     fn preload(&mut self) {
         let Some(path) = manifest_path() else { return };
-        let Ok(mut text) = std::fs::read_to_string(&path) else { return };
-        if text.lines().next() == Some("zakuro-gles 3") {
-            text = upgrade_manifest(&text);
-            let _ = std::fs::write(&path, &text);
-        }
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
         if text.lines().next() != Some(MANIFEST_HEADER) {
             log::info!("{} is from another version, starting it over", path.display());
             let _ = std::fs::remove_file(&path);
+            let _ = vertex_path(&path, 0).parent().map(std::fs::remove_dir_all);
             return;
         }
         let started = std::time::Instant::now();
         self.preloading = true;
+        let mut units: HashMap<u64, Option<ShaderUnit>> = HashMap::new();
         let mut count = 0;
-        for line in text.lines() {
+        for line in text.lines().skip(1) {
             let mut fields = line.split_whitespace();
-            let Some(Ok(vertex)) = fields.next().map(|field| u64::from_str_radix(field, 16)) else { continue };
-            if vertex != 0 && !self.vertex_sources.contains_key(&vertex) {
-                match std::fs::read_to_string(vertex_path(&path, vertex)) {
-                    Ok(source) => {
-                        self.vertex_sources.insert(vertex, source);
-                    }
-                    Err(_) => continue,
+            let vertex = match fields.next() {
+                Some("0") => 0,
+                Some(field) => {
+                    let Ok(parts) = field.split(':').map(|part| u64::from_str_radix(part, 16)).collect::<Result<Vec<u64>, _>>() else { continue };
+                    let Some((&[fingerprint, entry], semantics)) = parts.split_first_chunk::<2>() else { continue };
+                    let Ok(semantics) = <[u32; SEMANTICS]>::try_from(semantics.iter().map(|&value| value as u32).collect::<Vec<u32>>()) else { continue };
+                    let unit = units.entry(fingerprint).or_insert_with(|| {
+                        let bytes = std::fs::read(vertex_path(&path, fingerprint)).ok().filter(|bytes| bytes.len() == (PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4)?;
+                        let mut unit = ShaderUnit::new();
+                        for (word, chunk) in unit.program.iter_mut().chain(unit.descriptors.iter_mut()).zip(bytes.as_chunks::<4>().0) {
+                            *word = u32::from_le_bytes(*chunk);
+                        }
+                        unit.prepare();
+                        Some(unit)
+                    });
+                    let Some(unit) = unit else { continue };
+                    unit.entry_point = entry as u32;
+                    let Ok(hash) = self.vertex_stage(unit, semantics) else { continue };
+                    hash
+                }
+                None => continue,
+            };
+            let Some(Ok(flags)) = fields.next().map(|field| u32::from_str_radix(field, 16)) else { continue };
+            let mut r = [0u32; 0x300];
+            for (register, value) in fields.filter_map(|field| field.split_once('=')) {
+                if let (Ok(register @ 0..0x300), Ok(value)) = (usize::from_str_radix(register, 16), u32::from_str_radix(value, 16)) {
+                    r[register] = value;
                 }
             }
-            let mut words = fields.map(|word| u32::from_str_radix(word, 16));
-            let Some(Ok(writes_depth)) = words.next() else { continue };
-            let words: Vec<u32> = words.filter_map(Result::ok).collect();
-            if words.len() < FRAGMENT_CONSTANTS {
-                continue;
+            let mut packed = Vec::new();
+            if flags & 1 << 17 != 0 {
+                let Some(lighting) = crate::lighting::Lighting::read(&r) else { continue };
+                lighting.pack(&mut packed);
             }
-            let (constants, lighting) = words.split_at(FRAGMENT_CONSTANTS);
-            if !lighting.is_empty() && (lighting.len() < 29 || lighting.len() != 29 + 2 * lighting[1] as usize) {
-                continue;
-            }
-            let Ok(constants) = <[u32; FRAGMENT_CONSTANTS]>::try_from(constants) else { continue };
-            match self.program(&constants, writes_depth != 0, lighting, vertex, true) {
+            let (writes_depth, sources) = (flags & 1 << 16 != 0, std::array::from_fn(|unit| flags & 1 << (8 + unit) != 0));
+            let (constants, lighting) = fragment_constants(&r, flags & 7, flags >> 4 & 7, sources, flags >> 12 & 3, writes_depth, (flags & 1 << 17 != 0).then_some(&packed[..]));
+            match self.program(&constants, writes_depth, &lighting, vertex, true, None) {
                 Ok(_) => count += 1,
                 Err(error) => log::warn!("could not prepare a shader from {}, {error}", path.display()),
             }
@@ -3228,12 +4067,82 @@ impl Gles {
         self.shades
     }
 
+    /// the scale pictures read back come at: always the console's own, the
+    /// surfaces drawn bigger are brought down to it.
     pub fn scale(&self) -> u32 {
         1
     }
 
-    pub fn set_scale(&mut self, _scale: u32) -> u32 {
-        1
+    /// draws at scale times the console's resolution from now on, in
+    /// quarters from 1 to 4, and says what it draws at.
+    pub fn set_scale(&mut self, scale: f32) -> f32 {
+        self.quarters = (scale * 4.0).round().clamp(4.0, 16.0) as u32;
+        self.quarters as f32 / 4.0
+    }
+
+    /// a length of the console's in the surfaces' pixels: whole for any
+    /// multiple of 4, as every tile and surface edge is.
+    fn up(&self, length: u32) -> u32 {
+        length * self.quarters / 4
+    }
+
+    fn scaled(&self) -> bool {
+        self.quarters != 4
+    }
+
+    /// the console-size texture and framebuffer for a kind of surface and
+    /// size.
+    /// SAFETY: on the GL thread
+    unsafe fn native(&mut self, depth: bool, width: u32, height: u32) -> Result<(glow::Texture, glow::Framebuffer), String> {
+        if let Some(&made) = self.natives.get(&(depth, width, height)) {
+            return Ok(made);
+        }
+        let gl = &self.gl;
+        let texture = gl.create_texture()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_storage_2d(glow::TEXTURE_2D, 1, if depth { glow::DEPTH24_STENCIL8 } else { glow::RGBA8 }, width as i32, height as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+        let framebuffer = gl.create_framebuffer()?;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+        if depth {
+            gl.draw_buffers(&[glow::NONE]);
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::DEPTH_STENCIL_ATTACHMENT, glow::TEXTURE_2D, Some(texture), 0);
+        } else {
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
+        }
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        self.natives.insert((depth, width, height), (texture, framebuffer));
+        Ok((texture, framebuffer))
+    }
+
+    /// rows of a surface, from the bottom as GL counts them, between it and
+    /// its console-size twin, the nearest pixel scaled each way: up after an
+    /// upload into the twin, or down to read it back.
+    /// SAFETY: on the GL thread
+    unsafe fn through_native(&mut self, index: usize, up: bool, rows: &[(u32, u32)]) -> Result<(glow::Texture, glow::Framebuffer), String> {
+        let (width, height, kind) = (self.surfaces[index].width, self.surfaces[index].height, self.surfaces[index].kind);
+        let depth = matches!(kind, Kind::Depth(_));
+        let native = self.native(depth, width, height)?;
+        let surface = if depth { self.framebuffer(None, Some(index))? } else { self.framebuffer(Some(index), None)? };
+        let (from, to) = if up { (native.1, surface) } else { (surface, native.1) };
+        let mask = if depth { glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT } else { glow::COLOR_BUFFER_BIT };
+        disturb();
+        let (big_width, small_width) = (self.up(width) as i32, width as i32);
+        let gl = &self.gl;
+        gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(from));
+        gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(to));
+        gl.disable(glow::SCISSOR_TEST);
+        gl.color_mask(true, true, true, true);
+        gl.depth_mask(true);
+        gl.stencil_mask(0xFF);
+        for &(bottom, count) in rows {
+            let (small, big) = ([0, bottom as i32, small_width, (bottom + count) as i32], [0, self.up(bottom) as i32, big_width, self.up(bottom + count) as i32]);
+            let (a, b) = if up { (small, big) } else { (big, small) };
+            gl.blit_framebuffer(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], mask, glow::NEAREST);
+        }
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        Ok(native)
     }
 
     fn texture_source(&self, texture: &DrawnTexture) -> Option<(usize, u32)> {
@@ -3267,6 +4176,97 @@ impl Gles {
             .map(|index| (index, (texture.addr - self.surfaces[index].addr) / tile_rows * 8))
     }
 
+    /// a texture that starts with rows nothing drew and goes on into a
+    /// drawing, as Fire Emblem Awakening samples its picture for an effect:
+    /// the drawing and how many rows of memory come before it, which the
+    /// copy takes from memory as they are.
+    fn texture_over_drawing(&self, texture: &DrawnTexture) -> Option<(usize, u32)> {
+        // above the console's resolution this stays with memory for now
+        if self.scaled() {
+            return None;
+        }
+        static FROM_MEMORY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FROM_MEMORY.get_or_init(|| std::env::var_os("ZAKURO_NO_PAST_DRAWING").is_some()) {
+            return None;
+        }
+        let kind = Kind::Color(texture.format);
+        let tile_rows = 8 * texture.width * kind.bytes();
+        let (index, lead) = self.surfaces.iter().enumerate().find_map(|(index, s)| {
+            let offset = s.addr.checked_sub(texture.addr).filter(|&offset| offset > 0 && offset % tile_rows == 0)?;
+            let lead = offset / tile_rows * 8;
+            let fits = s.kind == kind && s.tiled && !s.stale && s.dirty.is_some() && s.width == texture.width && lead < texture.height && texture.height <= lead + s.height;
+            fits.then_some((index, lead))
+        })?;
+        // the rows before it as memory has them, which another drawing there
+        // would not be
+        let lead_bytes = lead / 8 * tile_rows;
+        (!self.surfaces.iter().any(|s| s.dirty_overlaps(texture.addr, lead_bytes))).then_some((index, lead))
+    }
+
+    /// a texture inside rows drawings of other widths drew, as Moon's bloom
+    /// samples the smaller buffers it drew into the bigger one's memory, and
+    /// Kingdom Hearts 3D a 256x512 texture over its picture and the glow
+    /// drawn below it: each drawing, how many tiles past the texture's start
+    /// it starts, and the texture's tiles it holds, or none for whole rows of
+    /// tiles no drawing holds, which come from memory at the console's size.
+    /// the copy takes the drawings' tiles over a run at a time on the GPU
+    /// rather than reading them back. RGBA8 alone, which a blit leaves as it
+    /// is.
+    fn retiled_sources(&self, texture: &DrawnTexture) -> Option<Vec<(Option<usize>, i64, i64, i64)>> {
+        let kind = Kind::Color(ColorFormat::Rgba8);
+        if texture.format != ColorFormat::Rgba8 || texture.width % 8 != 0 || texture.height % 8 != 0 {
+            return None;
+        }
+        let (tile, len) = ((64 * kind.bytes()) as i64, texture.width * texture.height * kind.bytes());
+        let (across, tiles) = ((texture.width / 8) as i64, (texture.width / 8 * texture.height / 8) as i64);
+        let mut pieces = Vec::new();
+        for (index, s) in self.surfaces.iter().enumerate().filter(|(_, s)| s.dirty_overlaps(texture.addr, len)) {
+            // its dirty rows are what it drew, though others took rows of it
+            let (first, last) = s.dirty?;
+            let offset = s.addr as i64 - texture.addr as i64;
+            let other_across = (s.width / 8) as i64;
+            let run = across.min(other_across);
+            let (from, to) = ((offset / tile + first as i64 / 8 * other_across).max(0), (offset / tile + last as i64 / 8 * other_across).min(tiles));
+            let fits = s.kind == kind
+                && s.tiled
+                && s.width % 8 == 0
+                && first % 8 == 0
+                && last % 8 == 0
+                && offset % tile == 0
+                && (other_across % across == 0 || across % other_across == 0)
+                && from % run == 0
+                && to % run == 0
+                && (from - offset / tile) % run == 0;
+            if !fits {
+                return None;
+            }
+            pieces.push((Some(index), offset / tile, from, to));
+        }
+        if pieces.is_empty() {
+            return None;
+        }
+        // the whole texture, a piece after another
+        pieces.sort_by_key(|piece| piece.2);
+        let mut whole = Vec::with_capacity(pieces.len() + 1);
+        let mut at = 0;
+        for piece in pieces.into_iter().chain([(None, 0, tiles, tiles)]) {
+            if piece.2 < at {
+                return None;
+            }
+            if piece.2 > at {
+                if self.scaled() || at % across != 0 || piece.2 % across != 0 {
+                    return None;
+                }
+                whole.push((None, 0, at, piece.2));
+            }
+            if piece.0.is_some() {
+                at = piece.3;
+                whole.push(piece);
+            }
+        }
+        Some(whole)
+    }
+
     /// the surface a drawn texture is the whole of, as it is, which a draw
     /// into another surface samples in place, upside down, rather than a copy.
     fn whole_surface(&self, texture: &DrawnTexture) -> Option<usize> {
@@ -3284,7 +4284,7 @@ impl Gles {
         if *FROM_MEMORY.get_or_init(|| crate::switch("ZAKURO_NO_GPU_TEXTURES", "drawn textures read from memory")) {
             return false;
         }
-        self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].dirty.is_some())
+        self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].dirty.is_some()) || self.texture_over_drawing(texture).is_some() || crate::fast_with(crate::speedup::TILES) && self.retiled_sources(texture).is_some()
     }
 
     fn copy_objects(&mut self, texture: &DrawnTexture) -> Result<(([glow::Program; 3], glow::VertexArray), (glow::Texture, glow::Framebuffer)), String> {
@@ -3312,7 +4312,7 @@ impl Gles {
             return Ok((copiers, copy));
         }
         let (copy, framebuffer) = (self.texture_name()?, self.framebuffer_name()?);
-        let (gl, width, height) = (self.gl, texture.width as i32, texture.height as i32);
+        let (gl, width, height) = (self.gl, self.up(texture.width) as i32, self.up(texture.height) as i32);
         self.worker.post_keeping(move || {
             disturb();
             // SAFETY: on the GL thread, the names are new and the copy is the
@@ -3328,8 +4328,97 @@ impl Gles {
         Ok((copiers, (copy, framebuffer)))
     }
 
-    fn copy_texture(&mut self, texture: &DrawnTexture) -> Result<glow::Texture, String> {
+    /// lets go of the surfaces nothing drew into or read for a while, what
+    /// they drew written back first, with their framebuffers and the copies
+    /// made from them. a title drawing into new places scene after scene
+    /// would fill a handheld's memory otherwise, Mario Kart 7 sixty-four at
+    /// a time. no surface index is held between draws, so they can move.
+    fn retire<M: GpuMemory>(&mut self, memory: &mut M) -> Result<(), String> {
+        self.retire_at = self.flushes + RETIRE_EVERY;
+        let flushes = self.flushes;
+        let old: Vec<usize> = (0..self.surfaces.len()).filter(|&i| flushes - self.surfaces[i].used > SURFACE_KEEP_FLUSHES).collect();
+        if old.is_empty() {
+            return Ok(());
+        }
+        let dirty = old.iter().copied().filter(|&i| self.surfaces[i].dirty.is_some()).collect();
+        self.write_back(memory, dirty)?;
+        let mut remap = vec![None; self.surfaces.len()];
+        let mut kept = 0;
+        for (i, slot) in remap.iter_mut().enumerate() {
+            if !old.contains(&i) {
+                *slot = Some(kept);
+                kept += 1;
+            }
+        }
+        let (mut textures, mut framebuffers) = (Vec::new(), Vec::new());
+        let mut ranges = Vec::new();
+        for &i in &old {
+            let s = &self.surfaces[i];
+            textures.push(s.texture);
+            for (texture, framebuffer) in [s.upright, s.packed].into_iter().flatten() {
+                textures.push(texture);
+                framebuffers.push(framebuffer);
+            }
+            ranges.push((s.addr, s.size()));
+        }
+        let made_from = |t: &DrawnTexture| {
+            let size = t.width * t.height * t.format.bytes_per_pixel() as u32;
+            ranges.iter().any(|&(addr, len)| t.addr < addr + len && addr < t.addr + size)
+        };
+        self.copies.retain(|t, &mut (texture, framebuffer)| {
+            let keep = !made_from(t);
+            if !keep {
+                textures.push(texture);
+                framebuffers.push(framebuffer);
+            }
+            keep
+        });
+        self.copied.retain(|t, _| !made_from(t));
+        self.over_drawing.retain(|t, _| !made_from(t));
+        for ((color, depth), framebuffer) in std::mem::take(&mut self.framebuffers) {
+            let (color, depth) = (color.map(|i| remap[i]), depth.map(|i| remap[i]));
+            match (color, depth) {
+                (Some(None), _) | (_, Some(None)) => framebuffers.push(framebuffer),
+                _ => {
+                    self.framebuffers.insert((color.flatten(), depth.flatten()), framebuffer);
+                }
+            }
+        }
+        let mut i = 0;
+        self.surfaces.retain(|_| {
+            i += 1;
+            remap[i - 1].is_some()
+        });
+        log::debug!("let go of {} surfaces nothing used for {SURFACE_KEEP_FLUSHES} batches, {} left", old.len(), self.surfaces.len());
+        let gl = self.gl;
+        self.worker.post_keeping(move || {
+            disturb();
+            // SAFETY: on the GL thread, after every draw that used them
+            unsafe {
+                for framebuffer in framebuffers {
+                    gl.delete_framebuffer(framebuffer);
+                }
+                for texture in textures {
+                    gl.delete_texture(texture);
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn copy_texture<M: GpuMemory>(&mut self, memory: &mut M, texture: &DrawnTexture) -> Result<glow::Texture, String> {
+        if !self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].dirty.is_some()) {
+            if let Some(pieces) = self.retiled_sources(texture) {
+                return self.copy_retiled(memory, texture, pieces);
+            }
+        }
+        if self.texture_source(texture).is_none() {
+            if let Some((source, lead)) = self.texture_over_drawing(texture) {
+                return self.copy_over_drawing(memory, texture, source, lead);
+            }
+        }
         let (source, row) = self.texture_source(texture).ok_or("the buffer a texture was drawn into is gone")?;
+        self.surfaces[source].used = self.flushes;
         let (([color, depth, stencil], empty), (copy, framebuffer)) = self.copy_objects(texture)?;
         let surface = &self.surfaces[source];
         let stamp = (surface.texture, surface.version, row);
@@ -3337,8 +4426,8 @@ impl Gles {
             return Ok(copy);
         }
         let (kind, image) = (surface.kind, surface.texture);
-        let base = surface.height as i32 - 1 - row as i32;
-        let (width, height) = (texture.width as i32, texture.height as i32);
+        let base = self.up(surface.height) as i32 - 1 - self.up(row) as i32;
+        let (width, height) = (self.up(texture.width) as i32, self.up(texture.height) as i32);
         let opaque = matches!(texture.format, ColorFormat::Rgb8 | ColorFormat::Rgb565) as i32;
         let levels = match texture.format {
             ColorFormat::Rgba8 | ColorFormat::Rgb8 => [255.0; 4],
@@ -3400,7 +4489,280 @@ impl Gles {
         Ok(copy)
     }
 
+    /// the copy of a texture inside drawings of other widths, their tiles
+    /// blitted over from each a run at a time as adopt does, and the rows no
+    /// drawing holds uploaded from memory.
+    fn copy_retiled<M: GpuMemory>(&mut self, memory: &mut M, texture: &DrawnTexture, pieces: Vec<(Option<usize>, i64, i64, i64)>) -> Result<glow::Texture, String> {
+        let (_, (copy, framebuffer)) = self.copy_objects(texture)?;
+        let (width, across) = (texture.width, (texture.width / 8) as i64);
+        let row_bytes = (width * 4) as usize;
+        let (mut runs, mut rows, mut bytes) = (Vec::with_capacity(pieces.len()), Vec::new(), Vec::new());
+        for (index, offset, from, to) in pieces {
+            let Some(index) = index else {
+                let (first, last) = ((from / across * 8) as u32, (to / across * 8) as u32);
+                let start = bytes.len();
+                bytes.resize(start + (last - first) as usize * row_bytes, 0);
+                memory.read(texture.addr + first * row_bytes as u32, &mut bytes[start..]);
+                rows.push((first, last, start));
+                continue;
+            };
+            self.surfaces[index].used = self.flushes;
+            let read = self.framebuffer(Some(index), None)?;
+            let s = &self.surfaces[index];
+            runs.push((read, s.texture, s.version, (s.width / 8) as i64, s.height as i64, offset, from, to));
+        }
+        let version = runs.iter().fold(0, |hash: u64, run| hash.rotate_left(17) ^ run.2);
+        let stamp = (runs[0].1, version, 0x8000_0000 | runs.len() as u32);
+        let drawn_again = self.copied.insert(*texture, stamp) != Some(stamp);
+        let unchanged = self.over_drawing.get(texture).is_some_and(|before| *before == bytes);
+        if !drawn_again && unchanged {
+            return Ok(copy);
+        }
+        // memory's rows the right way up, as the copy is
+        let decoded: Vec<(u32, u32, Vec<u8>)> = rows
+            .iter()
+            .map(|&(first, last, start)| {
+                let mut out = vec![0u8; (last - first) as usize * row_bytes];
+                for y in first..last {
+                    for x in 0..width {
+                        let at = start + pixel_offset(true, x, y - first, width, 4);
+                        let o = ((y - first) * width + x) as usize * 4;
+                        out[o..o + 4].copy_from_slice(&ColorFormat::Rgba8.decode(&bytes[at..at + 4]));
+                    }
+                }
+                (first, last, out)
+            })
+            .collect();
+        self.over_drawing.insert(*texture, bytes);
+        let (quarters, gl) = (self.quarters as i64, self.gl);
+        self.worker.post_keeping(move || {
+            for run in &runs {
+                flush_clears(Some(run.1));
+            }
+            disturb();
+            // SAFETY: on the GL thread, every run lies inside both the
+            // drawing and the copy, and the rows uploaded inside the copy
+            unsafe {
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(framebuffer));
+                gl.disable(glow::SCISSOR_TEST);
+                gl.color_mask(true, true, true, true);
+                let up = |length: i64| (length * quarters / 4) as i32;
+                for &(read, _, _, other_across, height, offset, from, to) in &runs {
+                    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read));
+                    let run = across.min(other_across);
+                    // the drawing upside down, the copy the right way up
+                    for at in (from..to).step_by(run as usize) {
+                        let (x, y) = ((at - offset) % other_across * 8, (at - offset) / other_across * 8);
+                        let (to_x, to_y) = (at % across * 8, at / across * 8);
+                        gl.blit_framebuffer(up(x), up(height - y - 8), up(x + run * 8), up(height - y), up(to_x), up(to_y + 8), up(to_x + run * 8), up(to_y), glow::COLOR_BUFFER_BIT, glow::NEAREST);
+                    }
+                }
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                if !decoded.is_empty() {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(copy));
+                    for (first, last, out) in &decoded {
+                        gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, *first as i32, width as i32, (last - first) as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(out)));
+                    }
+                }
+            }
+        });
+        Ok(copy)
+    }
+
+    /// the copy of a texture whose first rows are memory and the rest a
+    /// drawing: the drawing's rows drawn in on the GPU as copy_texture does,
+    /// the rows before them uploaded from memory.
+    fn copy_over_drawing<M: GpuMemory>(&mut self, memory: &mut M, texture: &DrawnTexture, source: usize, lead: u32) -> Result<glow::Texture, String> {
+        self.surfaces[source].used = self.flushes;
+        let (([color, _, _], empty), (copy, framebuffer)) = self.copy_objects(texture)?;
+        let (width, height) = (texture.width, texture.height);
+        let bpp = texture.format.bytes_per_pixel();
+        let length = (lead * width) as usize * bpp;
+        // the memory rows, compared with what they were rather than hashed,
+        // which a byte at a time took a fifth of the GPU thread's time
+        let unchanged = match (memory.slice(texture.addr, length), self.over_drawing.get(texture)) {
+            (Some(now), Some(before)) => now == &before[..],
+            (None, Some(before)) => {
+                let mut now = vec![0u8; length];
+                memory.read(texture.addr, &mut now);
+                now == *before
+            }
+            (_, None) => false,
+        };
+        let surface = &self.surfaces[source];
+        let stamp = (surface.texture, surface.version, u32::MAX - lead);
+        let drawn_again = self.copied.insert(*texture, stamp) != Some(stamp);
+        if unchanged && !drawn_again {
+            return Ok(copy);
+        }
+        let mut bytes = vec![0u8; length];
+        memory.read(texture.addr, &mut bytes);
+        let image = surface.texture;
+        // the copy's row y is the texture's row y, the drawing's first row
+        // the texture's row lead
+        let base = surface.height as i32 - 1 + lead as i32;
+        let opaque = matches!(texture.format, ColorFormat::Rgb8 | ColorFormat::Rgb565) as i32;
+        let levels = match texture.format {
+            ColorFormat::Rgba8 | ColorFormat::Rgb8 => [255.0; 4],
+            ColorFormat::Rgb565 => [31.0, 63.0, 31.0, 255.0],
+            ColorFormat::Rgb5A1 => [31.0, 31.0, 31.0, 1.0],
+            ColorFormat::Rgba4 => [15.0; 4],
+        };
+        let rows = (!unchanged).then(|| {
+            let mut rows = vec![0u8; (lead * width * 4) as usize];
+            for y in 0..lead {
+                for x in 0..width {
+                    let at = pixel_offset(true, x, y, width, bpp as u32);
+                    let out = ((y * width + x) * 4) as usize;
+                    rows[out..out + 4].copy_from_slice(&texture.format.decode(&bytes[at..at + bpp]));
+                }
+            }
+            rows
+        });
+        self.over_drawing.insert(*texture, bytes);
+        let gl = self.gl;
+        self.worker.post_keeping(move || {
+            flush_clears(Some(image));
+            disturb();
+            // SAFETY: on the GL thread, the copy is the texture's size, the
+            // drawing's rows are read inside it and the upload covers the
+            // rows before them
+            unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                gl.viewport(0, 0, width as i32, height as i32);
+                gl.enable(glow::SCISSOR_TEST);
+                gl.scissor(0, lead as i32, width as i32, (height - lead) as i32);
+                gl.disable(glow::BLEND);
+                gl.disable(glow::DEPTH_TEST);
+                gl.disable(glow::STENCIL_TEST);
+                gl.disable(glow::CULL_FACE);
+                gl.bind_vertex_array(Some(empty));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_sampler(0, None);
+                gl.bind_texture(glow::TEXTURE_2D, Some(image));
+                gl.color_mask(true, true, true, true);
+                gl.use_program(Some(color));
+                gl.uniform_1_i32(gl.get_uniform_location(color, "source").as_ref(), 0);
+                gl.uniform_1_i32(gl.get_uniform_location(color, "base").as_ref(), base);
+                gl.uniform_1_i32(gl.get_uniform_location(color, "opaque").as_ref(), opaque);
+                gl.uniform_4_f32_slice(gl.get_uniform_location(color, "levels").as_ref(), &levels);
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                gl.disable(glow::SCISSOR_TEST);
+                if let Some(rows) = &rows {
+                    gl.bind_texture(glow::TEXTURE_2D, Some(copy));
+                    gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, width as i32, lead as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(rows)));
+                }
+            }
+        });
+        Ok(copy)
+    }
+
+    /// a texture copy of whole rows of tiles of a picture the GPU drew and
+    /// has not written to memory, done on the GPU as a display transfer that
+    /// keeps the layout and format: done on the CPU, the picture would have
+    /// to be read back first, which stalls the GPU every time. false leaves
+    /// it to the CPU. widths and skips are in bytes, as the copy gives them.
+    pub(crate) fn texture_copy<M: GpuMemory>(&mut self, memory: &mut M, input: u32, output: u32, size: u32, input_lines: (u32, u32), output_lines: (u32, u32)) -> Result<bool, String> {
+        let done = self.texture_copy_on_gpu(memory, input, output, size, input_lines, output_lines)?;
+        if !done {
+            let details = format!("to {output:08X}, lines of (bytes, skip) {input_lines:?} into {output_lines:?}");
+            left_to_cpu("a texture copy", input, size, details, &self.surfaces);
+        }
+        Ok(done)
+    }
+
+    fn texture_copy_on_gpu<M: GpuMemory>(&mut self, memory: &mut M, input: u32, output: u32, size: u32, input_lines: (u32, u32), output_lines: (u32, u32)) -> Result<bool, String> {
+        static CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Drawn texture copies set to Memory in the menu leaves these to the
+        // CPU too, the way out if one goes wrong
+        let cpu = || std::env::var_os("ZAKURO_NO_GPU_TEXTURES").is_some() || crate::switch("ZAKURO_CPU_TEXTURE_COPIES", "texture copies on the CPU");
+        if *CPU.get_or_init(cpu) {
+            return Ok(false);
+        }
+        // above the console's resolution these stay with the CPU for now
+        if size == 0 || self.scaled() {
+            return Ok(false);
+        }
+        let Some((addr, width, column, copy, output_width, format)) = self.surfaces.iter().find_map(|s| {
+            let Kind::Color(format) = s.kind else { return None };
+            if !s.tiled || s.dirty.is_none() {
+                return None;
+            }
+            let bpp = s.kind.bytes();
+            let (tile, tile_row) = (64 * bpp, 8 * s.row_bytes());
+            let offset = input.checked_sub(s.addr)?;
+            if offset + size > s.size() || !offset.is_multiple_of(tile) {
+                return None;
+            }
+            // a line of the input is whole rows of tiles, or the same few
+            // tiles of each row of tiles, part of the picture's width
+            let line = match input_lines {
+                (0, _) | (_, 0) => tile_row,
+                (bytes, skip) if bytes + skip == tile_row => bytes,
+                _ => return None,
+            };
+            let start = offset % tile_row;
+            if !line.is_multiple_of(tile) || !size.is_multiple_of(line) || start + line > tile_row || (line == tile_row && start != 0) {
+                return None;
+            }
+            let (row, column) = (offset / tile_row * 8, start / tile * 8);
+            // the output one run of bytes, a texture just as wide, or lines
+            // as long as the input's with whole tiles between them, the
+            // left of a wider texture's rows of tiles
+            let output_width = match output_lines {
+                (0, _) | (_, 0) => line / bpp / 8,
+                (bytes, skip) if bytes == line && skip.is_multiple_of(tile) => (bytes + skip) / bpp / 8,
+                _ => return None,
+            };
+            Some((s.addr + row / 8 * tile_row, s.width, column, (line / bpp / 8, size / line * 8), output_width, format))
+        }) else {
+            return Ok(false);
+        };
+        let transfer = Transfer {
+            input: addr,
+            output,
+            input_width: width,
+            input_height: copy.1,
+            output_width,
+            output_height: copy.1,
+            copy,
+            scale: (1, 1),
+            flip: false,
+            input_linear: false,
+            output_tiled: true,
+            input_format: format,
+            output_format: format,
+            column,
+        };
+        self.display_transfer_on_gpu(memory, &transfer)
+    }
+
     pub(crate) fn display_transfer<M: GpuMemory>(&mut self, memory: &mut M, transfer: &Transfer) -> Result<bool, String> {
+        let done = self.display_transfer_on_gpu(memory, transfer)?;
+        if !done {
+            let t = transfer;
+            let len = t.input_width * t.input_height * Kind::Color(t.input_format).bytes();
+            let details = format!(
+                "{}x{} {:?} {} to {:08X} {}x{} {:?} {}, copying {:?} scaled {:?}{}",
+                t.input_width,
+                t.input_height,
+                t.input_format,
+                if t.input_linear { "linear" } else { "tiled" },
+                t.output,
+                t.output_width,
+                t.output_height,
+                t.output_format,
+                if t.output_tiled { "tiled" } else { "linear" },
+                t.copy,
+                t.scale,
+                if t.flip { " flipped" } else { "" }
+            );
+            left_to_cpu("a display transfer", t.input, len, details, &self.surfaces);
+        }
+        Ok(done)
+    }
+
+    fn display_transfer_on_gpu<M: GpuMemory>(&mut self, memory: &mut M, transfer: &Transfer) -> Result<bool, String> {
         let _timed = timed(0);
         self.pictures += 1;
         let t = transfer;
@@ -3425,7 +4787,7 @@ impl Gles {
             .max_by_key(|(s, _)| (s.dirty.is_some(), s.height))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
         else {
-            return Ok(false);
+            return self.transfer_below_memory(memory, t);
         };
         let input_end = addr as u64 + (input_size.0 * input_size.1 * input_kind.bytes()) as u64;
         let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
@@ -3452,26 +4814,141 @@ impl Gles {
         let gl = self.gl;
         let t = t.clone();
         let (source_texture, target_texture) = (self.surfaces[source].texture, self.surfaces[target].texture);
-        self.worker.post(move || unsafe {
+        // in the surfaces' pixels: the copy, the rows, and where it reads
+        let quarters = self.quarters;
+        let up = move |length: u32| length * quarters / 4;
+        self.worker.post_keeping(move || unsafe {
+            flush_clears(Some(source_texture));
+            flush_clears(Some(target_texture));
             disturb();
             // SAFETY: on the GL thread, both textures have immutable rgba8
             // storage and the dispatch stays inside them
             gl.use_program(Some(program));
             let int = |name: &str, value: i32| gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), value);
             let pair = |name: &str, x: u32, y: u32| gl.uniform_2_i32(gl.get_uniform_location(program, name).as_ref(), x as i32, y as i32);
-            pair("size", t.copy.0, t.copy.1);
+            pair("size", up(t.copy.0), up(t.copy.1));
             pair("scale", t.scale.0, t.scale.1);
-            int("input_height", t.input_height as i32);
-            int("output_height", t.output_height as i32);
+            int("input_height", up(t.input_height) as i32);
+            int("output_height", up(t.output_height) as i32);
             int("flip", t.flip as i32);
             int("input_format", format_index(t.input_format));
             int("output_format", format_index(t.output_format));
-            int("source_row", row as i32);
-            int("source_height", input_size.1 as i32);
+            int("source_row", up(row) as i32);
+            int("source_column", up(t.column) as i32);
+            int("target_row", 0);
+            int("source_height", up(input_size.1) as i32);
             gl.bind_image_texture(0, Some(source_texture), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
             gl.bind_image_texture(1, Some(target_texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
-            gl.dispatch_compute(t.copy.0.div_ceil(8), t.copy.1.div_ceil(8), 1);
+            gl.dispatch_compute(up(t.copy.0).div_ceil(8), up(t.copy.1).div_ceil(8), 1);
             gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        });
+        let target = &mut self.surfaces[target];
+        target.drew((0, target.height));
+        target.screen_batch += 1;
+        self.end_batch();
+        Ok(true)
+    }
+
+    /// a display transfer whose input starts with rows nothing drew and
+    /// goes on into a drawing to its end, as Fire Emblem Awakening shrinks
+    /// its picture for an effect, or goes on past a drawing into rows nothing
+    /// drew, as Metroid Samus Returns shrinks its 400 rows as 512: the rows
+    /// from memory and the drawing each go through the transfer on the GPU,
+    /// into their parts of the output, rather than the drawing being read
+    /// back for the CPU.
+    fn transfer_below_memory<M: GpuMemory>(&mut self, memory: &mut M, t: &Transfer) -> Result<bool, String> {
+        // above the console's resolution this stays with the CPU for now
+        if self.scaled() || t.flip || t.input_linear || t.column != 0 {
+            return Ok(false);
+        }
+        let (input_kind, output_kind) = (Kind::Color(t.input_format), Kind::Color(t.output_format));
+        let tile_rows = 8 * t.input_width * input_kind.bytes();
+        let rows = t.copy.1 * t.scale.1;
+        // the drawing, its size, and the rows of memory before or after it
+        let Some((addr, size, lead, before)) = self.surfaces.iter().find_map(|s| {
+            if s.kind != input_kind || !s.tiled || s.width != t.input_width || s.dirty.is_none() {
+                return None;
+            }
+            match s.addr.checked_sub(t.input).filter(|&offset| offset % tile_rows == 0) {
+                Some(0) => (s.height < rows && s.height % 8 == 0 && s.height.is_multiple_of(t.scale.1)).then_some((s.addr, (s.width, s.height), rows - s.height, false)),
+                Some(offset) => {
+                    let lead = offset / tile_rows * 8;
+                    (lead < rows && lead.is_multiple_of(t.scale.1) && rows <= lead + s.height).then_some((s.addr, (s.width, s.height), lead, true))
+                }
+                None => None,
+            }
+        }) else {
+            return Ok(false);
+        };
+        // the rows of memory come as they are, which another drawing there
+        // would make a read back again
+        let rest = if before { t.input } else { addr + size.1 / 8 * tile_rows };
+        if self.surfaces.iter().any(|s| s.dirty_overlaps(rest, lead / 8 * tile_rows)) {
+            return Ok(false);
+        }
+        let input_end = (t.input as u64 + (rows.div_ceil(8) * tile_rows) as u64).max(addr as u64 + (size.0 * size.1 * input_kind.bytes()) as u64);
+        let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
+        if (t.input as u64) < output_end && (t.output as u64) < input_end {
+            return Ok(false);
+        }
+        self.current()?;
+        let (memory_rows, drawing, target) = loop {
+            let memory_rows = self.surface_rows(memory, rest, (t.input_width, lead), input_kind, true, None)?;
+            let drawing = self.surface_rows(memory, addr, size, input_kind, true, None)?;
+            let target = self.surface_rows(memory, t.output, (t.output_width, t.output_height), output_kind, t.output_tiled, None)?;
+            if [memory_rows, drawing, target].iter().all(|&i| self.surfaces[i].checked) {
+                break (memory_rows, drawing, target);
+            }
+        };
+        let program = match self.transfer {
+            Some(program) => program,
+            None => {
+                let worker = self.worker.clone();
+                let program = worker.run(|| self.compute(TRANSFER_SOURCE))?;
+                self.transfer = Some(program);
+                program
+            }
+        };
+        let gl = self.gl;
+        let t = t.clone();
+        // each part: its source, the source's height, and the output rows
+        // it fills, from and how many
+        let (memory_rows, drawing) = ((self.surfaces[memory_rows].texture, lead), (self.surfaces[drawing].texture, size.1));
+        let [(a, a_height), (b, b_height)] = if before { [memory_rows, drawing] } else { [drawing, memory_rows] };
+        let split = a_height / t.scale.1;
+        let parts = [(a, a_height, 0, split), (b, b_height, split, t.copy.1 - split)];
+        let target_texture = self.surfaces[target].texture;
+        self.worker.post_keeping(move || unsafe {
+            for (source, ..) in parts {
+                flush_clears(Some(source));
+            }
+            flush_clears(Some(target_texture));
+            disturb();
+            // SAFETY: on the GL thread, every texture has immutable rgba8
+            // storage and each dispatch stays inside them
+            gl.use_program(Some(program));
+            let int = |name: &str, value: i32| gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), value);
+            let pair = |name: &str, x: u32, y: u32| gl.uniform_2_i32(gl.get_uniform_location(program, name).as_ref(), x as i32, y as i32);
+            pair("scale", t.scale.0, t.scale.1);
+            int("input_height", t.input_height as i32);
+            int("output_height", t.output_height as i32);
+            int("flip", 0);
+            int("input_format", format_index(t.input_format));
+            int("output_format", format_index(t.output_format));
+            int("source_row", 0);
+            int("source_column", 0);
+            gl.bind_image_texture(1, Some(target_texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
+            for (source, height, first, count) in parts {
+                if count == 0 {
+                    continue;
+                }
+                pair("size", t.copy.0, count);
+                int("source_height", height as i32);
+                int("target_row", first as i32);
+                gl.bind_image_texture(0, Some(source), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
+                gl.dispatch_compute(t.copy.0.div_ceil(8), count.div_ceil(8), 1);
+                gl.memory_barrier(glow::ALL_BARRIER_BITS);
+            }
         });
         let target = &mut self.surfaces[target];
         target.drew((0, target.height));
@@ -3528,7 +5005,7 @@ impl Gles {
         if !self.worker.here() {
             let worker = self.worker.clone();
             wait_from("picture");
-            return worker.run(|| self.picture(screen));
+            return worker.run_keeping(|| self.picture(screen));
         }
         let _timed = timed(1);
         let (width, height) = screen.size;
@@ -3545,6 +5022,8 @@ impl Gles {
         if self.surfaces[index].screen_batch != screen.batch {
             return Ok(None);
         }
+        // the screen's clear only, the others wait for their draws
+        flush_clears(Some(self.surfaces[index].texture));
         self.current()?;
         let program = match self.upright {
             Some(program) => program,
@@ -3555,6 +5034,7 @@ impl Gles {
             }
         };
         let (up_width, up_height) = (height, width);
+        let quarters = self.quarters;
         disturb();
         let gl = &self.gl;
         let surface = &mut self.surfaces[index];
@@ -3577,6 +5057,7 @@ impl Gles {
             };
             gl.use_program(Some(program));
             gl.uniform_2_i32(gl.get_uniform_location(program, "size").as_ref(), up_width as i32, up_height as i32);
+            gl.uniform_1_i32(gl.get_uniform_location(program, "quarters").as_ref(), quarters as i32);
             gl.bind_image_texture(0, Some(surface.texture), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
             gl.bind_image_texture(1, Some(texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
             gl.dispatch_compute(up_width.div_ceil(8), up_height.div_ceil(8), 1);
@@ -3597,16 +5078,14 @@ impl Gles {
 
     /// the program for a draw, none while the compiler thread is still
     /// making it, unless wait.
-    fn program(&mut self, constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32], vertex: u64, wait: bool) -> Result<Option<glow::Program>, String> {
+    fn program(&mut self, constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, lighting: &[u32], vertex: u64, wait: bool, inputs: Option<&dyn Fn() -> String>) -> Result<Option<glow::Program>, String> {
         let key = (*constants, writes_depth, lighting.to_vec(), vertex);
         if let Some(&program) = self.programs.get(&key) {
             return Ok(Some(program));
         }
-        if !self.worker.here() {
-            let worker = self.worker.clone();
-            wait_from("program");
-            return worker.run(|| self.program(constants, writes_depth, lighting, vertex, wait));
-        }
+        // what the compiler finished, still compiles or could not, and what
+        // it is given, are seen to here, only a program built here and now
+        // waits on the GL thread
         self.take_compiled(false);
         if let Some(&program) = self.programs.get(&key) {
             return Ok(Some(program));
@@ -3641,6 +5120,9 @@ impl Gles {
         };
         let compiled = if crate::fast_with(crate::speedup::PLAIN_MATH) { plain_multiplies(&vertex_source) } else { vertex_source };
         let cached = program_cache_path(&self.name, &compiled, &fragment);
+        if let Some(inputs) = inputs {
+            self.inputs.insert(key.clone(), inputs());
+        }
         if !wait && !self.preloading {
             if let Some(compiler) = self.compiler.as_mut() {
                 compiler.pending.insert(key.clone());
@@ -3649,6 +5131,11 @@ impl Gles {
                 }
                 return Ok(None);
             }
+        }
+        if !self.worker.here() {
+            let worker = self.worker.clone();
+            wait_from("program");
+            return worker.run(|| self.program(constants, writes_depth, lighting, vertex, wait, None));
         }
         disturb();
         let program = build_program(&self.gl, &compiled, &fragment, cached.as_deref())?;
@@ -3680,6 +5167,7 @@ impl Gles {
                 }
                 Err(error) => {
                     log::warn!("{error}");
+                    self.inputs.remove(&key);
                     if key.3 != 0 {
                         for translation in self.translated.values_mut() {
                             if *translation == Some(key.3) {
@@ -3695,20 +5183,21 @@ impl Gles {
 
     /// writes a new program the title used into the manifest, for the next
     /// run to prepare at startup.
-    fn note_program(&self, key: &ProgramKey) {
-        let (constants, writes_depth, lighting, vertex) = (&key.0, key.1, &key.2, key.3);
-        if self.preloading || constants[29] != 0 {
+    fn note_program(&mut self, key: &ProgramKey) {
+        let Some(inputs) = self.inputs.remove(key) else { return };
+        if self.preloading || key.0[29] != 0 {
             return;
         }
+        let vertex = key.3;
         let Some(path) = manifest_path() else { return };
-        let words = std::iter::once(writes_depth as u32).chain(constants.iter().copied()).chain(lighting.iter().copied());
-        let line = std::iter::once(format!("{vertex:x}")).chain(words.map(|word| format!("{word:x}"))).collect::<Vec<_>>().join(" ");
-        if vertex != 0 {
-            let file = vertex_path(&path, vertex);
-            if let (false, Some(source)) = (file.exists(), self.vertex_sources.get(&vertex)) {
-                let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&file, source));
+        let vertex = match vertex {
+            0 => "0".to_owned(),
+            hash => {
+                let Some((fingerprint, entry, semantics)) = self.vertex_inputs.get(&hash) else { return };
+                [*fingerprint, *entry as u64].into_iter().chain(semantics.iter().map(|&value| value as u64)).map(|value| format!("{value:x}")).collect::<Vec<_>>().join(":")
             }
-        }
+        };
+        let line = format!("{vertex} {inputs}");
         let written = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
             use std::io::Write;
             let new = !path.exists();
@@ -3784,13 +5273,26 @@ impl Gles {
             .surfaces
             .iter()
             .position(|s| s.addr == addr && s.width == width && s.height == height && s.kind == kind && s.tiled == tiled);
+        if let Some(index) = found {
+            self.surfaces[index].used = self.flushes;
+        }
         if found.is_none_or(|index| !self.surfaces[index].checked) && !self.worker.here() {
             if let Some(index) = found {
                 let size = self.surfaces[index].size();
                 let row = self.surfaces[index].row_bytes();
                 let (from, to) = rows.map_or((addr, size), |(start, end)| (addr + start * row, (end - start) * row));
-                let others = (0..self.surfaces.len()).any(|i| i != index && self.surfaces[i].dirty_overlaps(from, to));
-                if !others {
+                // what others drew there comes over without waiting on the GL thread
+                if self.adopt_all(index, from, to)?.is_empty() {
+                    // memory nothing wrote over since it held the shadow
+                    // still does, it is compared again now and then all the
+                    // same in case a write went past the journal
+                    let (stamp, batch) = self.surfaces[index].matched;
+                    let (written, now) = crate::journal::written_since(stamp, from, to);
+                    if written == crate::journal::Written::Nothing && self.flushes - batch < SURFACE_TRUSTED_FLUSHES {
+                        let surface = &mut self.surfaces[index];
+                        (surface.checked, surface.stale, surface.matched.0) = (true, false, now);
+                        return Ok(index);
+                    }
                     let same = match memory.slice(addr, size as usize) {
                         Some(bytes) => same(bytes, &self.surfaces[index].shadow),
                         None => {
@@ -3800,8 +5302,20 @@ impl Gles {
                         }
                     };
                     if same {
-                        self.surfaces[index].checked = true;
-                        self.surfaces[index].stale = false;
+                        let flushes = self.flushes;
+                        let surface = &mut self.surfaces[index];
+                        (surface.checked, surface.stale, surface.matched) = (true, false, (now, flushes));
+                        return Ok(index);
+                    }
+                    // all of it drawn, as after taking another's tiles, no
+                    // row of memory goes up: memory is only kept as the GL
+                    // thread would
+                    if self.surfaces[index].dirty == Some((0, height)) {
+                        let mut bytes = vec![0; size as usize];
+                        memory.read(addr, &mut bytes);
+                        let flushes = self.flushes;
+                        let surface = &mut self.surfaces[index];
+                        (surface.shadow, surface.picture, surface.checked, surface.stale, surface.matched) = (bytes, None, true, false, (now, flushes));
                         return Ok(index);
                     }
                 }
@@ -3812,6 +5326,7 @@ impl Gles {
         let index = match found {
             Some(index) => index,
             None => {
+                let (drawn_width, drawn_height) = (self.up(width) as i32, self.up(height) as i32);
                 let gl = &self.gl;
                 // SAFETY: the context is current
                 let texture = unsafe {
@@ -3821,7 +5336,7 @@ impl Gles {
                         Kind::Color(_) => glow::RGBA8,
                         Kind::Depth(_) => glow::DEPTH24_STENCIL8,
                     };
-                    gl.tex_storage_2d(glow::TEXTURE_2D, 1, format, width as i32, height as i32);
+                    gl.tex_storage_2d(glow::TEXTURE_2D, 1, format, drawn_width, drawn_height);
                     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
                     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
                     texture
@@ -3842,6 +5357,8 @@ impl Gles {
                     packed: None,
                     version: next_version(),
                     stale: false,
+                    used: self.flushes,
+                    matched: (0, 0),
                 });
                 self.surfaces.len() - 1
             }
@@ -3852,12 +5369,7 @@ impl Gles {
         let size = self.surfaces[index].size();
         let row = self.surfaces[index].row_bytes();
         let (from, to) = rows.map_or((addr, size), |(start, end)| (addr + start * row, (end - start) * row));
-        let mut others = Vec::new();
-        for other in (0..self.surfaces.len()).filter(|&i| i != index && self.surfaces[i].dirty_overlaps(from, to)).collect::<Vec<_>>() {
-            if !self.adopt(index, other)? {
-                others.push(other);
-            }
-        }
+        let others = self.adopt_all(index, from, to)?;
         if !others.is_empty() {
             self.write_back(memory, others)?;
         }
@@ -3878,12 +5390,35 @@ impl Gles {
         Ok(index)
     }
 
+    /// the surfaces drawn over a surface's memory from addr for len bytes
+    /// whose tiles could not come over, tried again while any does, the
+    /// rows one brings may join those of one that could not come before it.
+    fn adopt_all(&mut self, index: usize, addr: u32, len: u32) -> Result<Vec<usize>, String> {
+        let mut others: Vec<usize> = (0..self.surfaces.len()).filter(|&i| i != index && self.surfaces[i].dirty_overlaps(addr, len)).collect();
+        loop {
+            let before = others.len();
+            let mut left = Vec::new();
+            for other in others {
+                if !self.adopt(index, other)? {
+                    left.push(other);
+                }
+            }
+            others = left;
+            if others.is_empty() || others.len() == before {
+                return Ok(others);
+            }
+        }
+    }
+
     /// tiles another surface drew over this one's memory come over on the
     /// GPU, with the drawing, rather than through memory, when whole rows of
     /// tiles of both line up.
     fn adopt(&mut self, index: usize, other: usize) -> Result<bool, String> {
         let (s, o) = (&self.surfaces[index], &self.surfaces[other]);
-        if s.kind != o.kind || !matches!(s.kind, Kind::Depth(_)) || !s.tiled || !o.tiled || !crate::fast_with(crate::speedup::TILES) || s.width % 8 != 0 || o.width % 8 != 0 || s.height % 8 != 0 || o.height % 8 != 0 {
+        if matches!((s.kind, o.kind), (Kind::Color(_), Kind::Color(_))) && (s.kind != o.kind || s.tiled != o.tiled) && crate::fast_with(crate::speedup::TILES) {
+            return self.reinterpret(index, other);
+        }
+        if s.kind != o.kind || !s.tiled || !o.tiled || !crate::fast_with(crate::speedup::TILES) || s.width % 8 != 0 || o.width % 8 != 0 || s.height % 8 != 0 || o.height % 8 != 0 {
             return Ok(false);
         }
         let (across, other_across) = ((s.width / 8) as i64, (o.width / 8) as i64);
@@ -3920,42 +5455,51 @@ impl Gles {
             Kind::Color(_) => (self.framebuffer(Some(other), None)?, self.framebuffer(Some(index), None)?, glow::COLOR_BUFFER_BIT),
             Kind::Depth(_) => (self.framebuffer(None, Some(other))?, self.framebuffer(None, Some(index))?, glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT),
         };
-        disturb();
-        let gl = &self.gl;
-        // SAFETY: on the GL thread, every tile copied lies inside both
-        // surfaces
-        unsafe {
-            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(source));
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target));
-            gl.disable(glow::SCISSOR_TEST);
-            gl.color_mask(true, true, true, true);
-            gl.depth_mask(true);
-            gl.stencil_mask(0xFF);
-            let blit = |(x, y): (i64, i64), (to_x, to_y): (i64, i64), (wide, high): (i64, i64)| {
-                gl.blit_framebuffer(
-                    x as i32,
-                    (other_height - y - high) as i32,
-                    (x + wide) as i32,
-                    (other_height - y) as i32,
-                    to_x as i32,
-                    (height - to_y - high) as i32,
-                    (to_x + wide) as i32,
-                    (height - to_y) as i32,
-                    mask,
-                    glow::NEAREST,
-                )
-            };
-            if across == other_across {
-                blit((0, start / across * 8), (0, (start - offset) / across * 8), (across * 8, (end - start) / across * 8));
-            } else {
-                let segment = across.min(other_across);
-                for at in (start..end).step_by(segment as usize) {
-                    let target = at - offset;
-                    blit((at % other_across * 8, at / other_across * 8), (target % across * 8, target / across * 8), (segment * 8, 8));
+        let (quarters, gl) = (self.quarters as i64, self.gl);
+        let textures = (self.surfaces[other].texture, self.surfaces[index].texture);
+        // from the GPU thread as well, the draws before it go first
+        self.worker.post_keeping(move || {
+            // what either was cleared to is in before tiles go over
+            flush_clears(Some(textures.0));
+            flush_clears(Some(textures.1));
+            disturb();
+            // SAFETY: on the GL thread, every tile copied lies inside both
+            // surfaces
+            unsafe {
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(source));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target));
+                gl.disable(glow::SCISSOR_TEST);
+                gl.color_mask(true, true, true, true);
+                gl.depth_mask(true);
+                gl.stencil_mask(0xFF);
+                // in the surfaces' pixels, whole for tiles at any scale
+                let up = |length: i64| (length * quarters / 4) as i32;
+                let blit = |(x, y): (i64, i64), (to_x, to_y): (i64, i64), (wide, high): (i64, i64)| {
+                    gl.blit_framebuffer(
+                        up(x),
+                        up(other_height - y - high),
+                        up(x + wide),
+                        up(other_height - y),
+                        up(to_x),
+                        up(height - to_y - high),
+                        up(to_x + wide),
+                        up(height - to_y),
+                        mask,
+                        glow::NEAREST,
+                    )
+                };
+                if across == other_across {
+                    blit((0, start / across * 8), (0, (start - offset) / across * 8), (across * 8, (end - start) / across * 8));
+                } else {
+                    let segment = across.min(other_across);
+                    for at in (start..end).step_by(segment as usize) {
+                        let target = at - offset;
+                        blit((at % other_across * 8, at / other_across * 8), (target % across * 8, target / across * 8), (segment * 8, 8));
+                    }
                 }
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             }
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        }
+        });
         let o = &mut self.surfaces[other];
         o.dirty = left;
         o.checked = false;
@@ -3969,11 +5513,94 @@ impl Gles {
         Ok(true)
     }
 
+    /// the rows another colour surface drew over this one's memory in
+    /// another format or layout, as Kingdom Hearts 3D draws the same 128 KiB
+    /// as RGBA4 and as RGBA8 in turn: its pixels go through memory's bytes
+    /// into this one's on the GPU rather than being read back. whole rows of
+    /// both, at the console's size.
+    fn reinterpret(&mut self, index: usize, other: usize) -> Result<bool, String> {
+        let (s, o) = (&self.surfaces[index], &self.surfaces[other]);
+        let Some((first, last)) = o.dirty else { return Ok(false) };
+        let unit = |x: &Surface| x.row_bytes() * if x.tiled { 8 } else { 1 };
+        let lo = (o.addr + first * o.row_bytes()).max(s.addr);
+        let hi = (o.addr + last * o.row_bytes()).min(s.addr + s.size());
+        if self.scaled() || lo >= hi || (lo - s.addr) % unit(s) != 0 || (hi - s.addr) % unit(s) != 0 || (lo - o.addr) % unit(o) != 0 || (hi - o.addr) % unit(o) != 0 {
+            return Ok(false);
+        }
+        let (from, to) = ((lo - s.addr) / s.row_bytes(), (hi - s.addr) / s.row_bytes());
+        let (gone_from, gone_to) = ((lo - o.addr) / o.row_bytes(), (hi - o.addr) / o.row_bytes());
+        let left = match (first < gone_from, gone_to < last) {
+            (true, true) => return Ok(false),
+            (true, false) => Some((first, gone_from)),
+            (false, true) => Some((gone_to, last)),
+            (false, false) => None,
+        };
+        let merged = match s.dirty {
+            None => (from, to),
+            Some((a, b)) if b >= from && to >= a => (a.min(from), b.max(to)),
+            Some(_) => return Ok(false),
+        };
+        let shape = |x: &Surface| {
+            let Kind::Color(format) = x.kind else { unreachable!() };
+            ([x.width as i32, x.height as i32, x.kind.bytes() as i32, format_index(format)], x.tiled as i32, x.texture)
+        };
+        let ((target_shape, target_tiled, target), (source_shape, source_tiled, source)) = (shape(s), shape(o));
+        let delta = (lo - o.addr) as i32 - (from * s.row_bytes()) as i32;
+        let program = match self.reinterpreter {
+            Some(program) => program,
+            None => {
+                let program = if self.worker.here() {
+                    self.compute(REINTERPRET_SOURCE)?
+                } else {
+                    let worker = self.worker.clone();
+                    worker.run(|| self.compute(REINTERPRET_SOURCE))?
+                };
+                self.reinterpreter = Some(program);
+                program
+            }
+        };
+        let gl = self.gl;
+        self.worker.post_keeping(move || {
+            flush_clears(Some(source));
+            flush_clears(Some(target));
+            disturb();
+            // SAFETY: on the GL thread, both textures have immutable rgba8
+            // storage and every pixel read and written lies inside them
+            unsafe {
+                gl.use_program(Some(program));
+                let location = |name: &str| gl.get_uniform_location(program, name);
+                gl.uniform_4_i32_slice(location("target_shape").as_ref(), &target_shape);
+                gl.uniform_4_i32_slice(location("source_shape").as_ref(), &source_shape);
+                gl.uniform_2_i32(location("tiled").as_ref(), target_tiled, source_tiled);
+                gl.uniform_2_i32(location("rows").as_ref(), from as i32, (to - from) as i32);
+                gl.uniform_1_i32(location("delta").as_ref(), delta);
+                gl.bind_image_texture(0, Some(source), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
+                gl.bind_image_texture(1, Some(target), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
+                gl.dispatch_compute((target_shape[0] as u32).div_ceil(8), (to - from).div_ceil(8), 1);
+                gl.memory_barrier(glow::ALL_BARRIER_BITS);
+            }
+        });
+        let o = &mut self.surfaces[other];
+        (o.dirty, o.checked, o.stale, o.shadow, o.picture) = (left, false, true, Vec::new(), None);
+        let s = &mut self.surfaces[index];
+        (s.dirty, s.picture, s.version) = (Some(merged), None, next_version());
+        Ok(true)
+    }
+
     fn upload(&mut self, index: usize, bytes: &[u8]) {
         let _timed = timed(2);
         self.surfaces[index].version = next_version();
         let s = &self.surfaces[index];
-        let (width, height, kind, tiled, texture) = (s.width, s.height, s.kind, s.tiled, s.texture);
+        let (width, height, kind, tiled, mut texture) = (s.width, s.height, s.kind, s.tiled, s.texture);
+        // drawn bigger, the pixels go into the console-size twin first
+        if self.scaled() {
+            // SAFETY: on the GL thread, as uploads are
+            match unsafe { self.native(matches!(kind, Kind::Depth(_)), width, height) } {
+                Ok((native, _)) => texture = native,
+                Err(error) => log::error!("could not upload a surface drawn bigger, {error}"),
+            }
+        }
+        let s = &self.surfaces[index];
         let pixels = (width * height) as usize;
         let ranges: Vec<(u32, u32)> = match s.dirty {
             Some((start, end)) => [(0, start), (end, height)].into_iter().filter(|(from, to)| from < to).collect(),
@@ -4044,6 +5671,13 @@ impl Gles {
                         );
                     }
                 }
+            }
+        }
+        if self.scaled() {
+            let rows: Vec<(u32, u32)> = ranges.iter().map(|&(from, to)| (height - to, to - from)).collect();
+            // SAFETY: on the GL thread, as uploads are
+            if let Err(error) = unsafe { self.through_native(index, true, &rows) } {
+                log::error!("could not upload a surface drawn bigger, {error}");
             }
         }
     }
@@ -4141,8 +5775,14 @@ impl Gles {
         Ok(true)
     }
 
-    pub(crate) fn prepare_read<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
+    pub(crate) fn prepare_read<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, texture: Option<&crate::raster::DrawnTexture>) -> Result<(), String> {
         if self.surfaces.iter().any(|s| s.dirty_overlaps(addr, len)) {
+            let details = match texture {
+                Some(t) => format!("a {}x{} {:?} texture", t.width, t.height, t.format),
+                None => "a texture in a format no drawing has".to_owned(),
+            };
+            left_to_cpu("a texture read", addr, len, details, &self.surfaces);
+            sync_why("sync to read");
             self.sync(memory, addr, len)?;
         }
         Ok(())
@@ -4182,6 +5822,7 @@ impl Gles {
                 s.picture = None;
             }
         }
+        sync_why("sync before overwriting");
         self.sync(memory, addr, len)
     }
 
@@ -4213,7 +5854,7 @@ impl Gles {
         self.textures.retain(|_, texture| {
             let keep = flushes - texture.used < TEXTURE_KEEP_FLUSHES;
             if !keep {
-                gone.push(texture.texture);
+                gone.extend([Some(texture.texture), texture.alpha].into_iter().flatten());
             }
             keep
         });
@@ -4236,7 +5877,7 @@ impl Gles {
         }
         if !self.worker.here() {
             let worker = self.worker.clone();
-            wait_from("sync");
+            wait_from(SYNC_WHY.with(|cell| cell.replace("sync")));
             return worker.run(|| self.sync(memory, addr, len));
         }
         let overlapping: Vec<usize> = (0..self.surfaces.len()).filter(|&i| self.surfaces[i].overlaps(addr, len)).collect();
@@ -4252,7 +5893,7 @@ impl Gles {
         link(&self.gl, vertex, fragment)
     }
 
-    pub(crate) fn present(&mut self, shown: [Option<(crate::PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlay: Option<Arc<crate::Overlay>>, smooth: bool, interpolate: bool) {
+    pub(crate) fn present(&mut self, shown: [Option<(crate::PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<Arc<crate::Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
         let mut parts = Vec::new();
         for (index, item) in shown.into_iter().enumerate() {
             let Some((image, area)) = item else { continue };
@@ -4263,9 +5904,12 @@ impl Gles {
                         s.addr == screen.addr && s.width == width && s.height == height && s.kind == Kind::Color(screen.format) && !s.tiled
                     });
                     if let Some(s) = found {
-                        let screen = [screen.rows.1 as i32, screen.columns as i32, s.height as i32, screen.rows.0 as i32];
+                        let up = |length: u32| self.up(length) as i32;
+                        let screen = [up(screen.rows.1), up(screen.columns), up(s.height), up(screen.rows.0)];
                         let top = index == 0;
-                        parts.push(Part::Surface { texture: s.texture, screen, area, smooth: smooth && top, top, picture: (interpolate && top).then_some(s.version) });
+                        // the bottom screen too once it is drawn bigger, its pixels no longer the console's
+                        let smooth = smooth && (top || self.scaled());
+                        parts.push(Part::Surface { texture: s.texture, screen, area, smooth, top, picture: (interpolate && top).then_some(s.version) });
                     }
                 }
                 crate::PanelImage::Pixels(pixels, width, height) => parts.push(Part::Pixels { index, pixels, width, height, area, smooth: smooth && index == 0 }),
@@ -4274,7 +5918,7 @@ impl Gles {
         if let Some((x, y)) = cursor {
             parts.push(Part::Cursor { x, y });
         }
-        parts.extend(overlay.map(Part::Overlay));
+        parts.extend(overlays.into_iter().map(Part::Overlay));
         // with two waiting for the panel already, this one waits its turn:
         // dropped, its frame would have been drawn for nothing, where held
         // up, the title falls behind and skips drawing frames instead
@@ -4284,16 +5928,25 @@ impl Gles {
         self.presenting.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let presenting = self.presenting.clone();
         let gl = self.gl;
-        self.worker.post(move || {
+        self.worker.post_now(move || {
+            // the shown screens' clears, those of pictures still being drawn
+            // wait for their draws
+            for part in &parts {
+                if let Part::Surface { texture, .. } = part {
+                    flush_clears(Some(*texture));
+                }
+            }
             sim_present(&gl);
-            if let Err(error) = show(gl, parts) {
+            if let Err(error) = show(gl, parts, frames) {
                 log::error!("could not show the screens, {error}");
             }
             presenting.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         });
     }
 
-    fn read_depth(&mut self, index: usize, data: &mut [u8]) -> Result<(), String> {
+    /// a depth surface's depth and stencil packed into color and read, from
+    /// its console-size twin when it is drawn bigger.
+    fn read_depth(&mut self, index: usize, native: Option<glow::Texture>, data: &mut [u8]) -> Result<(), String> {
         let _timed = timed(4);
         disturb();
         let (depth, stencil, empty) = match self.packers {
@@ -4309,7 +5962,7 @@ impl Gles {
         };
         let gl = &self.gl;
         let surface = &mut self.surfaces[index];
-        let (width, height, texture) = (surface.width as i32, surface.height as i32, surface.texture);
+        let (width, height, texture) = (surface.width as i32, surface.height as i32, native.unwrap_or(surface.texture));
         let with_stencil = surface.kind == Kind::Depth(4);
         // SAFETY: the context is current, the packed texture is the size of
         // the surface and the buffer covers it
@@ -4407,9 +6060,15 @@ impl Gles {
                 continue;
             }
             let mut data = vec![0u8; (width * height * 4) as usize];
+            // drawn bigger, it comes down to the console's size first
+            // SAFETY: on the GL thread, as write backs are
+            let native = if self.scaled() { Some(unsafe { self.through_native(index, false, &[(0, height)])? }) } else { None };
             match kind {
                 Kind::Color(_) => {
-                    let framebuffer = self.framebuffer(Some(index), None)?;
+                    let framebuffer = match native {
+                        Some((_, framebuffer)) => framebuffer,
+                        None => self.framebuffer(Some(index), None)?,
+                    };
                     disturb();
                     let gl = &self.gl;
                     // SAFETY: the context is current, the buffer covers the surface
@@ -4420,7 +6079,7 @@ impl Gles {
                         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
                     }
                 }
-                Kind::Depth(_) => self.read_depth(index, &mut data)?,
+                Kind::Depth(_) => self.read_depth(index, native.map(|(texture, _)| texture), &mut data)?,
             }
             let s = &self.surfaces[index];
             let bpp = kind.bytes() as usize;
@@ -4466,26 +6125,56 @@ impl Gles {
         Ok(())
     }
 
-    fn texture(&mut self, bound: &BoundTexture) -> Result<glow::Texture, String> {
+    fn texture(&mut self, bound: &BoundTexture) -> Result<(glow::Texture, Option<glow::Texture>), String> {
         let _timed = timed(6);
-        let key = bound.etc1.as_ref().map_or(Arc::as_ptr(&bound.texels) as *const u8, |blocks| Arc::as_ptr(blocks) as *const u8) as usize;
+        let key = bound.packed.as_ref().map_or(Arc::as_ptr(&bound.texels) as *const u8, |(_, bytes)| Arc::as_ptr(bytes) as *const u8) as usize;
         if let Some(texture) = self.textures.get_mut(&key) {
             texture.used = self.flushes;
-            return Ok(texture.texture);
+            return Ok((texture.texture, texture.alpha));
         }
         // its texels go up after the draws before
         let texture = self.texture_name()?;
-        let (gl, texels, etc1, width, height) = (self.gl, bound.texels.clone(), bound.etc1.clone(), bound.width as i32, bound.height as i32);
+        let alpha = match bound.packed {
+            Some((Packing::Etc1A4, _)) => Some(self.texture_name()?),
+            _ => None,
+        };
+        let (gl, texels, packed, width, height) = (self.gl, bound.texels.clone(), bound.packed.clone(), bound.width as i32, bound.height as i32);
         self.worker.post_keeping(move || {
             disturb();
             // SAFETY: on the GL thread, the name is new and the texels cover
             // the texture
             unsafe {
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                match etc1 {
-                    Some(blocks) => {
+                match packed {
+                    Some((packing @ (Packing::Etc1 | Packing::Etc1A4), blocks)) => {
+                        let (blocks, alphas) = blocks.split_at((width * height / 2) as usize);
                         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, 0);
-                        gl.compressed_tex_image_2d(glow::TEXTURE_2D, 0, ETC1_RGB8_OES as i32, width, height, 0, blocks.len() as i32, &blocks);
+                        gl.compressed_tex_image_2d(glow::TEXTURE_2D, 0, ETC1_RGB8_OES as i32, width, height, 0, blocks.len() as i32, blocks);
+                        if let (Packing::Etc1A4, Some(alpha)) = (packing, alpha) {
+                            gl.bind_texture(glow::TEXTURE_2D, Some(alpha));
+                            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::R8, width, height);
+                            gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, width, height, glow::RED, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(alphas)));
+                        }
+                    }
+                    Some((packing, bytes)) => {
+                        use glow::{GREEN, ONE, RED, ZERO};
+                        let (internal, format, kind, swizzle) = match packing {
+                            Packing::Rgb565 => (glow::RGB565, glow::RGB, glow::UNSIGNED_SHORT_5_6_5, None),
+                            Packing::Rgba5551 => (glow::RGB5_A1, glow::RGBA, glow::UNSIGNED_SHORT_5_5_5_1, None),
+                            Packing::Rgba4 => (glow::RGBA4, glow::RGBA, glow::UNSIGNED_SHORT_4_4_4_4, None),
+                            Packing::Luminance => (glow::R8, glow::RED, glow::UNSIGNED_BYTE, Some([RED, RED, RED, ONE])),
+                            Packing::Alpha => (glow::R8, glow::RED, glow::UNSIGNED_BYTE, Some([ZERO, ZERO, ZERO, RED])),
+                            Packing::LuminanceAlpha => (glow::RG8, glow::RG, glow::UNSIGNED_BYTE, Some([RED, RED, RED, GREEN])),
+                            Packing::Hilo => (glow::RG8, glow::RG, glow::UNSIGNED_BYTE, Some([ZERO, RED, GREEN, ONE])),
+                            Packing::Etc1 | Packing::Etc1A4 => unreachable!(),
+                        };
+                        if let Some(swizzle) = swizzle {
+                            for (parameter, source) in [glow::TEXTURE_SWIZZLE_R, glow::TEXTURE_SWIZZLE_G, glow::TEXTURE_SWIZZLE_B, glow::TEXTURE_SWIZZLE_A].into_iter().zip(swizzle) {
+                                gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, source as i32);
+                            }
+                        }
+                        gl.tex_storage_2d(glow::TEXTURE_2D, 1, internal, width, height);
+                        gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, width, height, format, kind, glow::PixelUnpackData::Slice(Some(&bytes)));
                     }
                     None => {
                         gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, width, height);
@@ -4494,8 +6183,8 @@ impl Gles {
                 }
             }
         });
-        self.textures.insert(key, Texture { texture, _texels: (bound.texels.clone(), bound.etc1.clone()), used: self.flushes });
-        Ok(texture)
+        self.textures.insert(key, Texture { texture, alpha, _texels: (bound.texels.clone(), bound.packed.clone()), used: self.flushes });
+        Ok((texture, alpha))
     }
 
     fn sampler(&mut self, linear: bool, s: Wrap, t: Wrap) -> Result<glow::Sampler, String> {
@@ -4524,15 +6213,15 @@ impl Gles {
         Ok(sampler)
     }
 
-    fn upload_tables(&mut self, tables: &Tables, procedural: &proctex::Tables) {
+    fn upload_tables(&mut self, tables: &Tables, procedural: &proctex::Tables, fog: &crate::fog::Table) {
         let _timed = timed(7);
         use std::hash::Hasher;
-        let generation = (tables.generation(), procedural.generation());
+        let generation = (tables.generation(), procedural.generation(), fog.generation());
         if self.tables == Some(generation) {
             return;
         }
         self.tables = Some(generation);
-        let mut key = [0u64; 25];
+        let mut key = [0u64; 26];
         for (table, (changed, hash)) in self.table_hashes.iter_mut().enumerate() {
             if *changed != tables.changed()[table] {
                 let mut hasher = rustc_hash::FxHasher::default();
@@ -4543,6 +6232,7 @@ impl Gles {
             key[table] = *hash;
         }
         key[24] = procedural.generation();
+        key[25] = fog.generation();
         if self.table_sets.len() > 256 {
             self.table_sets.clear();
         }
@@ -4555,6 +6245,7 @@ impl Gles {
                     procedural.maps().as_flattened().as_flattened(),
                     colors.as_flattened(),
                     steps.as_flattened(),
+                    fog.entries().as_flattened(),
                 ];
                 let mut bytes = Vec::with_capacity(TABLES_SIZE);
                 for part in parts {
@@ -4569,27 +6260,9 @@ impl Gles {
                 (self.table_set_ids, bytes)
             }
         };
-        // the GL thread puts them past what the draws before still read, the
-        // draws after bind them there
-        let gl = self.gl;
-        self.worker.post_keeping(move || {
-            local(|local| {
-                if let Some(&(_, at)) = local.table_sets.get(&id).filter(|(laps, _)| *laps == local.tables.laps) {
-                    local.tables_at = Some(at);
-                    return;
-                }
-                match local.tables.push(&gl, glow::SHADER_STORAGE_BUFFER, &bytes) {
-                    Ok(at) => {
-                        local.tables_at = Some(at);
-                        if local.table_sets.len() > 1024 {
-                            local.table_sets.clear();
-                        }
-                        local.table_sets.insert(id, (local.tables.laps, at));
-                    }
-                    Err(error) => log::error!("could not upload the lighting tables, {error}"),
-                }
-            })
-        });
+        // they go with the next draw rather than on their own, which would
+        // send the draws held so far off early
+        self.tables_due = Some((id, bytes));
     }
 
     fn triangles(triangles: &[[Screen; 3]], (width, height): (f32, f32), depth_map: DepthMap) -> Vec<u8> {
@@ -4645,9 +6318,12 @@ impl Gles {
         if empty || right <= left || top <= bottom {
             return Ok(());
         }
+        if self.flushes >= self.retire_at {
+            self.retire(memory)?;
+        }
         self.current()?;
         let vertex = match draw.geometry {
-            Geometry::Shaded(shading) => self.vertex_stage(shading)?,
+            Geometry::Shaded(shading) => self.vertex_stage(shading.unit, shading.semantics)?,
             Geometry::Triangles(_) => 0,
         };
 
@@ -4684,28 +6360,36 @@ impl Gles {
         };
         let (bottom, top) = (bottom + raise, top + raise);
 
-        let mut bound = [(self.blank, None); 3];
+        let mut bound = [(self.blank, None); 6];
         let mut sources = [None; 3];
-        let mut enabled = 0;
+        let (mut enabled, mut split) = (0, 0);
         for (unit, texture) in draw.textures.iter().enumerate() {
             if let Some(texture) = texture {
                 let sampler = self.sampler(texture.linear, texture.wrap_s, texture.wrap_t)?;
                 let image = match &texture.drawn {
-                    Some(drawn) => match self.whole_surface(drawn).filter(|&index| index != color) {
+                    Some(drawn) => match self.whole_surface(drawn).filter(|&index| index != color && self.surfaces[index].dirty.is_some()) {
                         Some(index) => {
+                            self.surfaces[index].used = self.flushes;
                             sources[unit] = Some(self.surfaces[index].texture);
                             self.surfaces[index].texture
                         }
-                        None => self.copy_texture(drawn)?,
+                        None => self.copy_texture(memory, drawn)?,
                     },
-                    None => self.texture(texture)?,
+                    None => {
+                        let (image, alpha) = self.texture(texture)?;
+                        if let Some(alpha) = alpha {
+                            bound[3 + unit] = (alpha, Some(sampler));
+                            split |= 1 << unit;
+                        }
+                        image
+                    }
                 };
                 bound[unit] = (image, Some(sampler));
                 enabled |= 1 << unit;
             }
         }
-        if draw.lighting.is_some() || draw.proctex {
-            self.upload_tables(draw.tables, draw.proctex_tables);
+        if draw.lighting.is_some() || draw.proctex || draw.fog {
+            self.upload_tables(draw.tables, draw.proctex_tables, draw.fog_table);
         }
 
         let depth_map = draw.depth_map;
@@ -4719,66 +6403,95 @@ impl Gles {
         };
 
         let worded = timed(19);
-        let mut words = Vec::with_capacity(UNIFORM_WORDS);
-        for base in STAGE_REGISTERS {
-            words.extend([r[base], r[base + 1], r[base + 2], r[base + 3], r[base + 4], 0, 0, 0]);
-        }
-        let texture_config = (r[REG_TEXTURE_CONFIG] & !7) | enabled;
-        words.extend([r[REG_UPDATE_BUFFER], r[REG_BUFFER_COLOR], r[REG_ALPHA_TEST], texture_config]);
-        for (base, source) in TEXTURE_UNIT_BASES.into_iter().zip(sources) {
-            words.extend([r[base + 2], r[base], source.is_some() as u32, 0]);
-        }
-        let depth_flags = depth_map.w_buffer as u32 | (shaded as u32) << 1;
-        words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
-        match draw.lighting {
-            Some(lighting) => lighting.pack(&mut words),
-            None => words.resize(UNIFORM_WORDS - PROCTEX_WORDS - COLOR_WORDS, 0),
-        }
-        let base = proctex::REG_CONFIG;
-        words.extend([r[base], r[base + 1], r[base + 2], r[base + 3], r[base + 4], r[base + 5], 0, 0]);
-        words.extend(color_words(r));
-
-        let mut constants = [0u32; FRAGMENT_CONSTANTS];
-        for (i, base) in STAGE_REGISTERS.into_iter().enumerate() {
-            constants[i] = r[base] & 0x0FFF_0FFF;
-            constants[6 + i] = r[base + 1] & 0x0077_7FFF;
-            constants[12 + i] = r[base + 2] & 0x000F_000F;
-            constants[18 + i] = r[base + 4] & 0x0003_0003;
-        }
-        constants[24] = r[REG_UPDATE_BUFFER] & 0xFF00;
-        constants[25] = texture_config & 0x2707;
-        for (unit, (base, source)) in TEXTURE_UNIT_BASES.into_iter().zip(sources).enumerate() {
-            let config = r[base + 2];
-            let unbordered = enabled & 1 << unit != 0 && (config >> 8) & 3 != 1 && (config >> 12) & 3 != 1;
-            constants[25] |= (source.is_some() as u32) << (16 + unit) | (unbordered as u32) << (20 + unit);
-        }
-        constants[26] = draw.lighting.is_some() as u32;
-        constants[27] = r[REG_ALPHA_TEST] & 0x71 | unused_outputs(r);
-        constants[28] = depth_flags | if writes_depth { WRITES_DEPTH } else { 0 };
-        if self.generic {
-            constants = generic_constants(&constants);
-        }
-        static GENERIC_LIGHTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let lighting = if draw.lighting.is_some() && !self.generic && !*GENERIC_LIGHTING.get_or_init(|| crate::switch("ZAKURO_GENERIC_LIGHTING", "generic lighting")) {
-            lighting_shape(&words)
+        // most draws' fragment registers are the last one's, as they stay set
+        // on the console until a list changes them, and so are the words
+        static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let check = *CHECK.get_or_init(|| crate::switch("ZAKURO_CHECK_REUSE", "reused colour words checked"));
+        let key = (draw.fragment_state, enabled | split << 4, sources.map(|source| source.is_some()), shaded, writes_depth, vertex);
+        let same = self.fragment.as_ref().is_some_and(|(last, ..)| *last == key);
+        let (words, program) = if same && !check {
+            let (_, last, program) = self.fragment.as_ref().expect("the last draw's");
+            let mut words = WORDS.take(UNIFORM_WORDS);
+            words.extend_from_slice(last);
+            (words, *program)
         } else {
-            Vec::new()
-        };
-        let program = match self.program(&constants, writes_depth, &lighting, vertex, false) {
-            Ok(Some(program)) => program,
-            // shaded on the CPU meanwhile
-            Ok(None) if vertex != 0 => return Err(COMPILING.to_owned()),
-            Ok(None) => self.program(&generic_constants(&constants), writes_depth, &[], 0, true)?.ok_or("no generic program")?,
-            Err(error) => {
-                if vertex != 0 {
-                    for translation in self.translated.values_mut() {
-                        if *translation == Some(vertex) {
-                            *translation = None;
+            let mut words = WORDS.take(UNIFORM_WORDS);
+            for base in STAGE_REGISTERS {
+                words.extend([r[base], r[base + 1], r[base + 2], r[base + 3], r[base + 4], 0, 0, 0]);
+            }
+            let texture_config = (r[REG_TEXTURE_CONFIG] & !7) | enabled;
+            words.extend([r[REG_UPDATE_BUFFER], r[REG_BUFFER_COLOR], r[REG_ALPHA_TEST], texture_config]);
+            for (unit, (base, source)) in TEXTURE_UNIT_BASES.into_iter().zip(sources).enumerate() {
+                words.extend([r[base + 2], r[base], source.is_some() as u32, split >> unit & 1]);
+            }
+            let depth_flags = depth_map.w_buffer as u32 | (shaded as u32) << 1;
+            words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
+            match draw.lighting {
+                Some(lighting) => lighting.pack(&mut words),
+                None => words.resize(UNIFORM_WORDS - PROCTEX_WORDS - COLOR_WORDS - FOG_WORDS, 0),
+            }
+            let base = proctex::REG_CONFIG;
+            words.extend([r[base], r[base + 1], r[base + 2], r[base + 3], r[base + 4], r[base + 5], 0, 0]);
+            words.extend(color_words(r));
+            words.extend([r[crate::fog::REG_COLOR], 0, 0, 0]);
+
+            let sources = sources.map(|source| source.is_some());
+            let (mut constants, mut lighting) = fragment_constants(r, enabled, split, sources, depth_flags, writes_depth, draw.lighting.map(|_| &words[LIGHTING_BASE..]));
+            if self.generic {
+                constants = generic_constants(&constants);
+            }
+            static GENERIC_LIGHTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if self.generic || *GENERIC_LIGHTING.get_or_init(|| crate::switch("ZAKURO_GENERIC_LIGHTING", "generic lighting")) {
+                lighting.clear();
+            }
+            // what the manifest keeps of the draw, for a later run to work
+            // the program out from again
+            let flags = enabled | split << 4 | sources.into_iter().enumerate().map(|(unit, source)| (source as u32) << (8 + unit)).sum::<u32>() | depth_flags << 12 | (writes_depth as u32) << 16 | (draw.lighting.is_some() as u32) << 17;
+            let inputs = || std::iter::once(format!("{flags:x}")).chain(key_registers().filter(|&register| r[register] != 0).map(|register| format!("{register:x}={:x}", r[register]))).collect::<Vec<_>>().join(" ");
+            let mut exact = true;
+            // a stand-in takes a program of its own only when one was built,
+            // its own vertex program comes first and makes it needless
+            let built = match draw.stand_in {
+                true => Ok(self.programs.get(&(constants, writes_depth, lighting.clone(), vertex)).copied()),
+                false => self.program(&constants, writes_depth, &lighting, vertex, false, Some(&inputs)),
+            };
+            let program = match built {
+                Ok(Some(program)) => program,
+                // shaded on the CPU meanwhile
+                Ok(None) if vertex != 0 => return Err(COMPILING.to_owned()),
+                Ok(None) => {
+                    exact = false;
+                    self.program(&generic_constants(&constants), writes_depth, &[], 0, true, None)?.ok_or("no generic program")?
+                }
+                Err(error) => {
+                    if vertex != 0 {
+                        for translation in self.translated.values_mut() {
+                            if *translation == Some(vertex) {
+                                *translation = None;
+                            }
                         }
                     }
+                    return Err(error);
                 }
-                return Err(error);
+            };
+            if same {
+                let (_, last, last_program) = self.fragment.as_ref().expect("the last draw's");
+                if *last != words || *last_program != program {
+                    let changed: Vec<usize> = (0..words.len()).filter(|&i| last.get(i) != words.get(i)).collect();
+                    log::warn!("reused colour words differ at {changed:?}, program the same {}", *last_program == program);
+                }
             }
+            if exact {
+                match &mut self.fragment {
+                    Some((last_key, last, last_program)) => {
+                        (*last_key, *last_program) = (key, program);
+                        last.clear();
+                        last.extend_from_slice(&words);
+                    }
+                    None => self.fragment = Some((key, words.to_vec(), program)),
+                }
+            }
+            (words, program)
         };
 
         drop(worded);
@@ -4811,15 +6524,18 @@ impl Gles {
         }
         let framebuffer = self.framebuffer(Some(color), depth)?;
 
+        // the viewport and scissor in the surfaces' pixels
+        let k = self.quarters as f32 / 4.0;
+        let up = |length: i32| (length as f32 * k).round() as i32;
         let geometry = match draw.geometry {
             Geometry::Triangles(triangles) => Submit::Triangles {
-                viewport: [0, raise, draw.width as i32, draw.height as i32],
+                viewport: [0, up(raise), up(draw.width as i32), up(draw.height as i32)],
                 vertices: Self::triangles(triangles, (draw.width as f32, draw.height as f32), depth_map),
                 count: (triangles.len() * 3) as i32,
             },
             Geometry::Shaded(shading) => {
                 let (x, y, width, height) = shading.viewport;
-                let viewport = [x.round() as i32, (y + raise as f32).round() as i32, width.round() as i32, height.round() as i32];
+                let viewport = [(x * k).round() as i32, ((y + raise as f32) * k).round() as i32, (width * k).round() as i32, (height * k).round() as i32];
                 let shaded = timed(16);
                 let (uniforms, inputs, stride) = Self::shading_bytes(shading, depth_map);
                 let attributes = match shading.fetched {
@@ -4837,7 +6553,7 @@ impl Gles {
                         Attributes::Resident { arrays: fetched.arrays.iter().map(|array| array.bytes.clone()).collect(), slots }
                     }
                     Some(fetched) => {
-                        let mut bytes = Vec::new();
+                        let mut bytes = BYTES.take(fetched.arrays.iter().map(|array| array.bytes.len() + 16).sum());
                         let mut starts = Vec::with_capacity(fetched.arrays.len());
                         for array in &fetched.arrays {
                             bytes.resize(bytes.len().next_multiple_of(16), 0);
@@ -4866,11 +6582,12 @@ impl Gles {
                     Some((bytes, highest)) if !thin && matches!(attributes, Attributes::Resident { .. }) => (Vec::new(), (0, highest), Some(bytes.clone())),
                     _ => {
                         let range = shading.indices[..kept].iter().fold((u32::MAX, 0), |(low, high), &index| (low.min(index), high.max(index)));
-                        let indices: Vec<u8> = if range.1 <= 0xFFFF {
-                            super::le_bytes(&shading.indices[..kept], |index| (index as u16).to_le_bytes())
+                        let mut indices = BYTES.take(kept * 4);
+                        if range.1 <= 0xFFFF {
+                            shading.indices[..kept].iter().for_each(|&index| indices.extend_from_slice(&(index as u16).to_le_bytes()));
                         } else {
-                            super::le_bytes(&shading.indices[..kept], u32::to_le_bytes)
-                        };
+                            shading.indices[..kept].iter().for_each(|&index| indices.extend_from_slice(&index.to_le_bytes()));
+                        }
                         (indices, range, None)
                     }
                 };
@@ -4885,7 +6602,7 @@ impl Gles {
             framebuffer,
             program,
             depth_range,
-            scissor: [left, bottom, right - left, top - bottom],
+            scissor: [up(left), up(bottom), up(right) - up(left), up(top) - up(bottom)],
             color_mask,
             blend: blend.map(|config| (config, r[REG_BLEND_COLOR])),
             depth: if depth.is_some() && (depth_test || depth_write) {
@@ -4902,13 +6619,77 @@ impl Gles {
             geometry,
             targets: [Some(self.surfaces[color].texture), depth.map(|depth| self.surfaces[depth].texture)],
             sources,
+            tables: self.tables_due.take(),
         };
+        self.worker.post_draw(job, self.gl);
+        Ok(())
+    }
+
+    /// lets the compiler thread end after the program it builds, and the GL
+    /// thread finish what it was sent, before the process ends: the driver's
+    /// exit freeing what a build still used corrupted the heap.
+    pub fn stop(&mut self) {
+        if let Some(Compiler { jobs, thread, done, .. }) = self.compiler.take() {
+            drop((jobs, done));
+            let _ = thread.join();
+        }
+        self.worker.run(|| ());
+    }
+
+    /// the surfaces of two eyes' buffers, colour then depth, alike in kind
+    /// and size, a copy can go between.
+    fn eye_surfaces(&self, first: [(u32, u32); 2], other: [(u32, u32); 2]) -> Option<[(usize, usize); 2]> {
+        let find = |(addr, size): (u32, u32), depth: bool| self.surfaces.iter().position(|s| s.addr == addr && s.tiled && s.size() == size && matches!(s.kind, Kind::Depth(_)) == depth);
+        let pairs = [(find(first[0], false)?, find(other[0], false)?), (find(first[1], true)?, find(other[1], true)?)];
+        let shape = |i: usize| (self.surfaces[i].width, self.surfaces[i].height, self.surfaces[i].kind);
+        pairs.iter().all(|&(a, b)| shape(a) == shape(b)).then_some(pairs)
+    }
+
+    pub(crate) fn can_mirror(&self, first: [(u32, u32); 2], other: [(u32, u32); 2]) -> bool {
+        self.eye_surfaces(first, other).is_some()
+    }
+
+    /// copies one eye's colour and depth over the other's, the draws the
+    /// other left out as stereo twins.
+    pub(crate) fn mirror(&mut self, first: [(u32, u32); 2], other: [(u32, u32); 2]) -> Result<(), String> {
+        let pairs = self.eye_surfaces(first, other).ok_or("an eye's buffers are gone")?;
+        let mut copies = Vec::new();
+        for (i, &(from, to)) in pairs.iter().enumerate() {
+            let (read, draw) = match i {
+                0 => (self.framebuffer(Some(from), None)?, self.framebuffer(Some(to), None)?),
+                _ => (self.framebuffer(None, Some(from))?, self.framebuffer(None, Some(to))?),
+            };
+            let mask = if i == 0 { glow::COLOR_BUFFER_BIT } else { glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT };
+            let size = (self.up(self.surfaces[from].width) as i32, self.up(self.surfaces[from].height) as i32);
+            copies.push((read, draw, mask, size, self.surfaces[from].texture, self.surfaces[to].texture));
+        }
         let gl = self.gl;
-        self.worker.post_draw(move || {
-            if let Err(error) = job.submit(gl) {
-                log::error!("the GPU could not draw, {error}");
+        self.worker.post_keeping(move || {
+            for &(.., from, to) in &copies {
+                flush_clears(Some(from));
+                flush_clears(Some(to));
+            }
+            disturb();
+            // SAFETY: on the GL thread, the framebuffers are the surfaces'
+            // and both of a copy the same size
+            unsafe {
+                gl.disable(glow::SCISSOR_TEST);
+                gl.color_mask(true, true, true, true);
+                gl.depth_mask(true);
+                gl.stencil_mask(0xFF);
+                for (read, draw, mask, (width, height), ..) in copies {
+                    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read));
+                    gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(draw));
+                    gl.blit_framebuffer(0, 0, width, height, 0, 0, width, height, mask, glow::NEAREST);
+                }
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             }
         });
+        for (_, to) in pairs {
+            let height = self.surfaces[to].height;
+            self.surfaces[to].drew((0, height));
+            self.surfaces[to].used = self.flushes;
+        }
         Ok(())
     }
 
@@ -4917,9 +6698,8 @@ impl Gles {
         self.worker.flush();
     }
 
-    fn vertex_stage(&mut self, shading: &Shading) -> Result<u64, String> {
-        let unit = shading.unit;
-        let key = (unit.fingerprint(), unit.entry_point, shading.semantics);
+    fn vertex_stage(&mut self, unit: &ShaderUnit, semantics: [u32; SEMANTICS]) -> Result<u64, String> {
+        let key = (unit.fingerprint(), unit.entry_point, semantics);
         if let Some(found) = self.translated.get(&key) {
             return found.ok_or_else(|| "the vertex program stays on the CPU".to_owned());
         }
@@ -4935,6 +6715,14 @@ impl Gles {
             Ok(source) => {
                 let hash = fnv(&[&source]);
                 self.vertex_sources.insert(hash, source);
+                self.vertex_inputs.insert(hash, key);
+                if let (false, Some(path)) = (self.preloading, manifest_path()) {
+                    let file = vertex_path(&path, key.0);
+                    let bytes: Vec<u8> = unit.program.iter().chain(unit.descriptors.iter()).flat_map(|word| word.to_le_bytes()).collect();
+                    if std::fs::metadata(&file).map(|meta| meta.len()).ok() != Some(bytes.len() as u64) {
+                        let _ = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&file, bytes));
+                    }
+                }
                 Some(hash)
             }
             Err(error) => {
@@ -4949,19 +6737,24 @@ impl Gles {
     fn shading_bytes(shading: &Shading, depth_map: DepthMap) -> (Vec<u32>, Vec<u8>, usize) {
         let unit = shading.unit;
         let read = unit.inputs_read();
-        let registers: Vec<usize> = (0..INPUT_REGISTERS).filter(|r| read & (1 << r) != 0).collect();
-        let mut words: Vec<u32> = Vec::with_capacity(452);
+        let registers = || (0..INPUT_REGISTERS).filter(move |r| read & (1 << r) != 0);
+        let count = registers().count();
+        let mut words = WORDS.take(452);
         words.extend(unit.float_uniforms.iter().flatten().map(|value| value.to_bits()));
         for [count, start, step, _] in unit.int_uniforms {
             words.extend([count as u32, start as u32, step as i8 as u32, 0]);
         }
-        words.extend([unit.bool_uniforms as u32, unit.entry_point, registers.len() as u32, 0]);
+        words.extend([unit.bool_uniforms as u32, unit.entry_point, count as u32, 0]);
         words.extend([depth_map.scale.to_bits(), depth_map.offset.to_bits(), 0, 0]);
         let (x, y, width, height) = shading.viewport;
         words.extend([x, y, width, height].map(f32::to_bits));
-        let mut inputs = Vec::with_capacity((shading.inputs.len() * registers.len()).max(1) * 16);
+        // the vertices the GPU fetches itself have no inputs to pack
+        if shading.fetched.is_some() {
+            return (words, Vec::new(), count);
+        }
+        let mut inputs = BYTES.take((shading.inputs.len() * count).max(1) * 16);
         for input in shading.inputs {
-            for &register in &registers {
+            for register in registers() {
                 for value in input[register] {
                     inputs.extend_from_slice(&value.to_le_bytes());
                 }
@@ -4970,13 +6763,293 @@ impl Gles {
         if inputs.is_empty() {
             inputs.resize(16, 0);
         }
-        (words, inputs, registers.len())
+        (words, inputs, count)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// guest memory as one flat block from address zero.
+    struct Flat(Vec<u8>);
+
+    impl GpuMemory for Flat {
+        fn read(&mut self, addr: u32, out: &mut [u8]) {
+            out.copy_from_slice(&self.0[addr as usize..addr as usize + out.len()]);
+        }
+
+        fn write(&mut self, addr: u32, data: &[u8]) {
+            self.0[addr as usize..addr as usize + data.len()].copy_from_slice(data);
+        }
+    }
+
+    /// the copy of a drawn texture as the GPU holds it, RGBA rows from the
+    /// texture's first.
+    fn read_copy(gles: &mut Gles, texture: &DrawnTexture) -> Vec<u8> {
+        let (_, framebuffer) = gles.copies[texture];
+        let (gl, width, height) = (gles.gl, texture.width, texture.height);
+        let worker = gles.worker.clone();
+        worker.run(move || unsafe {
+            let mut data = vec![0u8; (width * height * 4) as usize];
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+            gl.read_pixels(0, 0, width as i32, height as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut data)));
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            data
+        })
+    }
+
+    #[test]
+    fn a_drawn_texture_that_starts_in_memory_is_copied_on_the_gpu() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let format = ColorFormat::Rgba8;
+        let (base, width, lead, drawn) = (0x1000u32, 32u32, 16u32, 32u32);
+        let mut memory = Flat(vec![0; 0x20000]);
+        let bytes = width * (lead + drawn) * 4;
+        for (i, byte) in memory.0[base as usize..(base + bytes) as usize].iter_mut().enumerate() {
+            *byte = (i * 29 + i / 3) as u8;
+        }
+        let decoded = |memory: &Flat, addr: u32, rows: u32| {
+            let mut out = vec![0u8; (width * rows * 4) as usize];
+            for y in 0..rows {
+                for x in 0..width {
+                    let at = (addr + pixel_offset(true, x, y, width, 4) as u32) as usize;
+                    let o = ((y * width + x) * 4) as usize;
+                    out[o..o + 4].copy_from_slice(&format.decode(&memory.0[at..at + 4]));
+                }
+            }
+            out
+        };
+        let drawing = base + lead / 8 * 8 * width * 4;
+        let index = gles.surface_rows(&mut memory, drawing, (width, drawn), Kind::Color(format), true, None).unwrap();
+        gles.surfaces[index].drew((0, drawn));
+        // the case that already worked, a texture the drawing is the whole of
+        // but for its copy, to check which way up the copy is
+        let inside = DrawnTexture { addr: drawing, width, height: drawn, format };
+        assert!(gles.holds(&inside));
+        gles.copy_texture(&mut memory, &inside).unwrap();
+        assert_eq!(read_copy(&mut gles, &inside), decoded(&memory, drawing, drawn));
+        // memory's rows first, then the drawing's
+        let over = DrawnTexture { addr: base, width, height: lead + drawn, format };
+        assert!(gles.holds(&over));
+        gles.copy_texture(&mut memory, &over).unwrap();
+        assert_eq!(read_copy(&mut gles, &over), decoded(&memory, base, lead + drawn));
+        // again unchanged, then with memory's rows changed, which the copy
+        // takes up
+        gles.copy_texture(&mut memory, &over).unwrap();
+        assert_eq!(read_copy(&mut gles, &over), decoded(&memory, base, lead + drawn));
+        for byte in &mut memory.0[base as usize..base as usize + 64] {
+            *byte ^= 0x5A;
+        }
+        gles.copy_texture(&mut memory, &over).unwrap();
+        assert_eq!(read_copy(&mut gles, &over), decoded(&memory, base, lead + drawn));
+        // the drawing stayed on the GPU
+        assert!(gles.surfaces.iter().any(|s| s.addr == drawing && s.dirty.is_some()));
+    }
+
+    #[test]
+    fn a_texture_inside_a_drawing_of_another_width_is_copied_on_the_gpu() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let format = ColorFormat::Rgba8;
+        let (base, width, height) = (0x1000u32, 256u32, 128u32);
+        let mut memory = Flat(vec![0; 0x40000]);
+        for (i, byte) in memory.0[base as usize..(base + width * height * 4) as usize].iter_mut().enumerate() {
+            *byte = (i * 31 + i / 7) as u8;
+        }
+        let index = gles.surface_rows(&mut memory, base, (width, height), Kind::Color(format), true, None).unwrap();
+        gles.surfaces[index].drew((0, height));
+        // Moon's bloom samples the smaller buffers it drew in the bigger one's memory
+        for (offset, w, h) in [(0x10000u32, 64u32, 32u32), (0x8000, 128, 64), (0, 512, 16)] {
+            let texture = DrawnTexture { addr: base + offset, width: w, height: h, format };
+            assert!(gles.retiled_sources(&texture).is_some());
+            gles.copy_texture(&mut memory, &texture).unwrap();
+            let mut expected = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let at = (texture.addr + pixel_offset(true, x, y, w, 4) as u32) as usize;
+                    let o = ((y * w + x) * 4) as usize;
+                    expected[o..o + 4].copy_from_slice(&format.decode(&memory.0[at..at + 4]));
+                }
+            }
+            assert_eq!(read_copy(&mut gles, &texture), expected, "{w}x{h} at {offset:X}");
+        }
+        assert!(gles.surfaces[index].dirty.is_some(), "the drawing stayed on the GPU");
+        // and over two drawings, as Kingdom Hearts 3D's picture and the glow
+        // below it
+        let (top, below) = (0x20000u32, 0x20000 + 256 * 64 * 4);
+        for (i, byte) in memory.0[top as usize..(top + 0x20000) as usize].iter_mut().enumerate() {
+            *byte = (i * 13 + i / 5) as u8;
+        }
+        for (addr, w, h) in [(top, 256, 64), (below, 128, 64)] {
+            let index = gles.surface_rows(&mut memory, addr, (w, h), Kind::Color(format), true, None).unwrap();
+            gles.surfaces[index].drew((0, h));
+        }
+        // and on past them into rows nothing drew, from memory
+        for (height, pieces) in [(96, 2), (128, 3)] {
+            let texture = DrawnTexture { addr: top, width: 256, height, format };
+            assert_eq!(gles.retiled_sources(&texture).map(|pieces| pieces.len()), Some(pieces));
+            gles.copy_texture(&mut memory, &texture).unwrap();
+            let mut expected = vec![0u8; (256 * height * 4) as usize];
+            for y in 0..height {
+                for x in 0..256 {
+                    let at = (top + pixel_offset(true, x, y, 256, 4) as u32) as usize;
+                    let o = ((y * 256 + x) * 4) as usize;
+                    expected[o..o + 4].copy_from_slice(&format.decode(&memory.0[at..at + 4]));
+                }
+            }
+            assert_eq!(read_copy(&mut gles, &texture), expected, "256x{height} over two drawings");
+        }
+    }
+
+    #[test]
+    fn a_shrinking_transfer_from_memory_into_a_drawing_matches_the_console() {
+        // memory first, as Fire Emblem Awakening's, or the drawing first, as
+        // Metroid Samus Returns'
+        shrinking_transfer(false);
+        shrinking_transfer(true);
+    }
+
+    fn shrinking_transfer(drawing_first: bool) {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let format = ColorFormat::Rgba8;
+        let (input, output, width, lead, drawn) = (0x1000u32, 0x10000u32, 32u32, 16u32, 32u32);
+        let mut memory = Flat(vec![0; 0x20000]);
+        let bytes = width * (lead + drawn) * 4;
+        for (i, byte) in memory.0[input as usize..(input + bytes) as usize].iter_mut().enumerate() {
+            *byte = (i * 37 + i / 5) as u8;
+        }
+        // the drawing starts two rows of tiles in, as Fire Emblem Awakening's
+        let drawing = if drawing_first { input } else { input + lead / 8 * 8 * width * 4 };
+        let index = gles.surface_rows(&mut memory, drawing, (width, drawn), Kind::Color(format), true, None).unwrap();
+        gles.surfaces[index].drew((0, drawn));
+        let (out_width, out_height) = (width / 2, (lead + drawn) / 2);
+        let transfer = Transfer {
+            input,
+            output,
+            input_width: width,
+            input_height: lead + drawn,
+            output_width: out_width,
+            output_height: out_height,
+            copy: (out_width, out_height),
+            scale: (2, 2),
+            flip: false,
+            input_linear: false,
+            output_tiled: true,
+            input_format: format,
+            output_format: format,
+            column: 0,
+        };
+        let mut expected = vec![0u8; (out_width * out_height * 4) as usize];
+        for y in 0..out_height {
+            for x in 0..out_width {
+                let mut sum = [0u32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let at = (input + pixel_offset(true, x * 2 + dx, y * 2 + dy, width, 4) as u32) as usize;
+                    let pixel = format.decode(&memory.0[at..at + 4]);
+                    for c in 0..4 {
+                        sum[c] += pixel[c] as u32;
+                    }
+                }
+                let at = pixel_offset(true, x, y, out_width, 4);
+                format.encode(sum.map(|c| ((c + 2) / 4) as u8), &mut expected[at..at + 4]);
+            }
+        }
+        assert!(gles.display_transfer(&mut memory, &transfer).unwrap());
+        // the drawing stayed on the GPU, nothing read it back
+        assert!(gles.surfaces.iter().any(|s| s.addr == drawing && s.dirty.is_some()));
+        gles.flush(&mut memory).unwrap();
+        assert_eq!(&memory.0[output as usize..output as usize + expected.len()], &expected[..], "drawing first {drawing_first}");
+    }
+
+    #[test]
+    fn a_texture_copy_of_a_drawing_stays_on_the_gpu_and_copies_it_exactly() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let (source, target, width, height) = (0x1000u32, 0x8000u32, 32u32, 32u32);
+        for format in [ColorFormat::Rgba8, ColorFormat::Rgb565] {
+            let size = width * height * format.bytes_per_pixel() as u32;
+            let mut memory = Flat(vec![0; 0x20000]);
+            for (i, byte) in memory.0[source as usize..(source + size) as usize].iter_mut().enumerate() {
+                *byte = (i * 37 + i / 5) as u8;
+            }
+            let index = gles.surface_rows(&mut memory, source, (width, height), Kind::Color(format), true, None).unwrap();
+            gles.surfaces[index].drew((0, height));
+            // the second and third rows of tiles, as a game copies part of one
+            let tile_rows = 8 * width * format.bytes_per_pixel() as u32;
+            assert!(gles.texture_copy(&mut memory, source + tile_rows, target, 2 * tile_rows, (0, 0), (0, 0)).unwrap());
+            gles.flush(&mut memory).unwrap();
+            let copied = &memory.0[target as usize..(target + 2 * tile_rows) as usize];
+            let original = &memory.0[(source + tile_rows) as usize..(source + 3 * tile_rows) as usize];
+            assert_eq!(copied, original, "{format:?}");
+            // part of the width, the way Fire Emblem Awakening copies a
+            // strip of its picture for an effect: lines of a few tiles, the
+            // rest of each row of tiles skipped, as the CPU would copy it
+            let tile = 64 * format.bytes_per_pixel() as u32;
+            for (first_tile, tiles, rows_of_tiles) in [(0u32, 2u32, 3u32), (1, 1, 2), (2, 2, 1)] {
+                let start = source + tile_rows + first_tile * tile;
+                let (line, skip) = (tiles * tile, tile_rows - tiles * tile);
+                let size = line * rows_of_tiles;
+                let mut expected = Vec::new();
+                for i in 0..rows_of_tiles {
+                    let at = (start + i * (line + skip)) as usize;
+                    expected.extend_from_slice(&memory.0[at..at + line as usize]);
+                }
+                let target = 0xC000;
+                // drawn again, the last check wrote it back
+                let index = gles.surfaces.iter().position(|s| s.addr == source && s.kind == Kind::Color(format)).unwrap();
+                gles.surfaces[index].drew((0, height));
+                assert!(gles.texture_copy(&mut memory, start, target, size, (line, skip), (line, 0)).unwrap(), "{format:?} {first_tile} {tiles}");
+                gles.flush(&mut memory).unwrap();
+                assert_eq!(&memory.0[target as usize..(target + size) as usize], &expected[..], "{format:?} {first_tile} {tiles}");
+            }
+            // into the same layout, gaps and all, as its battles save the
+            // picture: the columns between the lines keep what was there
+            {
+                let index = gles.surfaces.iter().position(|s| s.addr == source && s.kind == Kind::Color(format)).unwrap();
+                gles.surfaces[index].drew((0, height));
+                let (line, skip) = (tile_rows - tile, tile);
+                let size = line * 2;
+                let target = 0x14000usize;
+                for (i, byte) in memory.0[target..target + 2 * tile_rows as usize].iter_mut().enumerate() {
+                    *byte = (i * 11) as u8;
+                }
+                let mut expected = memory.0[target..target + 2 * tile_rows as usize].to_vec();
+                for i in 0..2usize {
+                    let from = (source + tile_rows) as usize + i * tile_rows as usize;
+                    let to = i * tile_rows as usize;
+                    expected[to..to + line as usize].copy_from_slice(&memory.0[from..from + line as usize]);
+                }
+                assert!(gles.texture_copy(&mut memory, source + tile_rows, target as u32, size, (line, skip), (line, skip)).unwrap(), "{format:?} strided");
+                gles.flush(&mut memory).unwrap();
+                assert_eq!(&memory.0[target..target + 2 * tile_rows as usize], &expected[..], "{format:?} strided");
+            }
+            // not starting on a tile is the CPU's
+            assert!(!gles.texture_copy(&mut memory, source + 16, target, tile_rows, (0, 0), (0, 0)).unwrap());
+        }
+    }
 
     #[test]
     fn stored_rows_match_encoding_each_pixel() {
@@ -5006,6 +7079,69 @@ mod tests {
                     }
                     assert!(stored == expected, "{format:?}, tiled {tiled}, rows {rows:?}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_drawing_in_another_format_over_a_surface_goes_over_through_memory_s_bytes() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        // Kingdom Hearts 3D draws the same 128 KiB as 256x256 RGBA4 and as
+        // 128x256 RGBA8
+        let (addr, len) = (0x1000u32, 0x20000usize);
+        let mut memory = Flat(vec![0; 0x30000]);
+        let fill = |memory: &mut Flat, seed: usize| {
+            for (i, byte) in memory.0[addr as usize..addr as usize + len].iter_mut().enumerate() {
+                *byte = (i * seed + i / 7) as u8;
+            }
+        };
+        fill(&mut memory, 11);
+        let rgba4 = gles.surface_rows(&mut memory, addr, (256, 256), Kind::Color(ColorFormat::Rgba4), true, None).unwrap();
+        fill(&mut memory, 29);
+        let drawn = memory.0.clone();
+        let rgba8 = gles.surface_rows(&mut memory, addr, (128, 256), Kind::Color(ColorFormat::Rgba8), true, None).unwrap();
+        gles.surfaces[rgba8].drew((0, 256));
+        // memory no longer holds the drawing, only the GPU does
+        fill(&mut memory, 3);
+        assert!(gles.reinterpret(rgba4, rgba8).unwrap());
+        assert_eq!((gles.surfaces[rgba4].dirty, gles.surfaces[rgba8].dirty), (Some((0, 256)), None));
+        let framebuffer = gles.framebuffer(Some(rgba4), None).unwrap();
+        let (gl, worker) = (gles.gl, gles.worker.clone());
+        let read = worker.run(move || unsafe {
+            let mut data = vec![0u8; 256 * 256 * 4];
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+            gl.read_pixels(0, 0, 256, 256, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut data)));
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            data
+        });
+        for y in 0..256u32 {
+            for x in 0..256u32 {
+                let at = (addr + pixel_offset(true, x, y, 256, 2) as u32) as usize;
+                let o = (((255 - y) * 256 + x) * 4) as usize;
+                assert_eq!(read[o..o + 4], ColorFormat::Rgba4.decode(&drawn[at..at + 2]), "at ({x}, {y})");
+            }
+        }
+        // and back, the bytes the RGBA8 drawing had
+        assert!(gles.reinterpret(rgba8, rgba4).unwrap());
+        let framebuffer = gles.framebuffer(Some(rgba8), None).unwrap();
+        let read = worker.run(move || unsafe {
+            let mut data = vec![0u8; 128 * 256 * 4];
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+            gl.read_pixels(0, 0, 128, 256, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut data)));
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            data
+        });
+        for y in 0..256u32 {
+            for x in 0..128u32 {
+                let at = (addr + pixel_offset(true, x, y, 128, 4) as u32) as usize;
+                let o = (((255 - y) * 128 + x) * 4) as usize;
+                assert_eq!(read[o..o + 4], ColorFormat::Rgba8.decode(&drawn[at..at + 4]), "back at ({x}, {y})");
             }
         }
     }

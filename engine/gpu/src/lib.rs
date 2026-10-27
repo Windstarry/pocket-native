@@ -2,8 +2,10 @@
 
 mod overlay;
 pub mod blend;
+pub mod fog;
 pub mod proctex;
 pub mod format;
+pub mod journal;
 pub mod lighting;
 pub mod raster;
 pub mod registers;
@@ -17,7 +19,7 @@ use registers::*;
 pub use overlay::{Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
 pub use renderer::{DrawCall, Renderer, SoftwareRenderer};
 #[cfg(feature = "gles")]
-pub use raster::gles::{layout_size, panel_timing, set_drops};
+pub use raster::gles::{layout_scale, layout_size, panel_timing, second_window, set_drops, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_window, stacked};
 
 /// how the GPU reaches guest memory.
 pub trait GpuMemory {
@@ -45,6 +47,35 @@ pub trait GpuMemory {
     fn translate(&self, paddr: u32) -> u32 {
         paddr
     }
+}
+
+/// a buffer, where as transfers and fills name it and how many bytes.
+type Span = (u32, u32);
+
+/// a title drawing a stereo picture draw by draw with the 3D slider down:
+/// both eyes' colour and depth buffers filled alike, each draw into one eye
+/// followed by the same draw into the other. such a pair is drawn once, into
+/// the buffers the pair was first found drawing into, and the other eye's
+/// take a copy of those before anything else touches them. Metroid: Samus
+/// Returns draws its whole scene so.
+#[derive(Default)]
+struct Twins {
+    /// buffers filled since anything drew into them, with the value.
+    fresh: Vec<(Span, u32)>,
+    /// the eye drawn into, colour then depth, the other, and the first's
+    /// buffer registers.
+    pair: Option<([Span; 2], [Span; 2], [u32; 2])>,
+    /// the other eye lacks draws the first took.
+    behind: bool,
+    /// the coming draw is the twin of the one just drawn.
+    skip: bool,
+    /// stays off, a copy over failed.
+    off: bool,
+    seen: bool,
+}
+
+fn overlap(a: Span, b: Span) -> bool {
+    a.0 < b.0.saturating_add(b.1) && b.0 < a.0.saturating_add(a.1)
 }
 
 /// what one LCD controller holds.
@@ -252,6 +283,8 @@ pub struct Gpu {
     /// the screen transfer count and the buffers shown when the panel last
     /// showed the screens.
     pub presented: Option<(u64, u32, u32)>,
+    /// the frame the last picture went up at.
+    pub presented_frame: u64,
     /// the last present showed something new, which an interpolated
     /// picture shows once more.
     pub presented_new: bool,
@@ -314,6 +347,7 @@ pub struct Gpu {
     /// time that comes soon after it took up again turns it off for the title.
     pub skip_right_eye: bool,
     right_buffers: Vec<u32>,
+    twins: Twins,
     stereo: bool,
     left_eye: Option<u32>,
     right_eye_candidate: bool,
@@ -378,6 +412,7 @@ impl Gpu {
             transfers: 0,
             pictures: 0,
             presented: None,
+            presented_frame: 0,
             presented_new: false,
             shown: 0,
             vertices_drawn: 0,
@@ -403,6 +438,7 @@ impl Gpu {
             skip_bottom: true,
             skip_right_eye: true,
             right_buffers: Vec::new(),
+            twins: Twins::default(),
             stereo: false,
             left_eye: None,
             right_eye_candidate: false,
@@ -535,6 +571,8 @@ impl Gpu {
         }
         let length = (end - start) as usize;
         let address = memory.translate(start);
+        self.twins_touch((address, length as u32), Some(value));
+        journal::note(address, length as u32);
         #[cfg(feature = "gles")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.before_fill(memory, address, length as u32, if matches!(width, 2 | 3) { width } else { 4 }) {
@@ -614,6 +652,7 @@ impl Gpu {
         flags: u32,
     ) {
         self.drawing = false;
+        self.twins_settle();
         // a skipped picture never reaches the screens, transfers anywhere
         // else go on, the title may be waiting for what they bring. a
         // transfer reaches a screen when it overlaps a buffer the screen was
@@ -744,6 +783,7 @@ impl Gpu {
                 output_tiled,
                 input_format,
                 output_format,
+                column: 0,
             };
             match hardware.display_transfer(memory, &transfer) {
                 Ok(true) => {
@@ -755,8 +795,8 @@ impl Gpu {
             }
         }
         // four bytes a pixel covers every format either side uses
-        self.sync_memory(memory, input_base, input_width * input_height * 4);
-        self.sync_memory(memory, output_base, output_width * output_height * 4);
+        self.sync_memory_for(memory, input_base, input_width * input_height * 4, "sync for a CPU transfer from");
+        self.sync_memory_for(memory, output_base, output_width * output_height * 4, "sync for a CPU transfer into");
         if copy_width == 0 || copy_height == 0 {
             return;
         }
@@ -838,15 +878,29 @@ impl Gpu {
         input_gap: u32,
         output_gap: u32,
     ) {
+        self.twins_settle();
         let input_width = (input_gap & 0xFFFF) * 16;
         let input_skip = (input_gap >> 16) * 16;
         // every line and the gaps between them
         let span = |width: u32, skip: u32| if width == 0 { size } else { size + size.div_ceil(width) * skip };
         let (input, output) = (memory.translate(input_paddr), memory.translate(output_paddr));
-        self.sync_memory(memory, input, span(input_width, input_skip));
         let output_width = (output_gap & 0xFFFF) * 16;
         let output_skip = (output_gap >> 16) * 16;
-        self.sync_memory(memory, output, span(output_width, output_skip));
+        // a copy of what the host GPU drew it does itself, without reading
+        // the picture back
+        #[cfg(feature = "gles")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            match hardware.texture_copy(memory, input, output, size, (input_width, input_skip), (output_width, output_skip)) {
+                Ok(true) => {
+                    self.transfers += 1;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => log::error!("the GPU could not copy a texture, {error}"),
+            }
+        }
+        self.sync_memory_for(memory, input, span(input_width, input_skip), "sync for a copy from");
+        self.sync_memory_for(memory, output, span(output_width, output_skip), "sync for a copy into");
 
         log::debug!(
             "texture copy: 0x{input_paddr:08X} -> 0x{output_paddr:08X} size 0x{size:X}"
@@ -903,7 +957,7 @@ impl Gpu {
     /// sharper pictures. on the device of a Vulkan presenter, when it gives
     /// one, the screens are shown straight from the images drawn.
     #[cfg(feature = "gles")]
-    pub fn enable_hardware_renderer(&mut self, scale: u32) -> Result<String, String> {
+    pub fn enable_hardware_renderer(&mut self, scale: f32) -> Result<String, String> {
         let mut hardware = raster::gles::Gles::new()?;
         let scale = hardware.set_scale(scale);
         let shaded = if hardware.shades() { "" } else { ", vertices shaded on the CPU," };
@@ -921,16 +975,24 @@ impl Gpu {
     }
 
     /// shows the screens on the panel the GPU drives itself, each in its
-    /// area, left, top, width and height in the panel's pixels, the overlay
+    /// area, left, top, width and height in the panel's pixels, the overlays
     /// over them, the top screen filtered when smooth and a picture halfway
     /// between its last two shown first when interpolating.
-    pub fn present_panel(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlay: Option<std::sync::Arc<Overlay>>, smooth: bool, interpolate: bool) {
+    pub fn present_panel(&mut self, shown: [Option<(PanelImage, [i32; 4])>; 2], cursor: Option<(i32, i32)>, overlays: Vec<std::sync::Arc<Overlay>>, smooth: bool, interpolate: bool, frames: u32) {
         #[cfg(feature = "gles")]
         if let Some(hardware) = self.resources.hardware.as_mut().or(self.panel.as_mut()) {
-            hardware.present(shown, cursor, overlay, smooth, interpolate);
+            hardware.present(shown, cursor, overlays, smooth, interpolate, frames);
         }
         #[cfg(not(feature = "gles"))]
-        let _ = (shown, cursor, overlay, smooth, interpolate);
+        let _ = (shown, cursor, overlays, smooth, interpolate, frames);
+    }
+
+    /// lets the host GPU's threads finish, for the process to end.
+    pub fn stop_hardware(&mut self) {
+        #[cfg(feature = "gles")]
+        if let Some(hardware) = self.resources.hardware.as_mut().or(self.panel.as_mut()) {
+            hardware.stop();
+        }
     }
 
     /// how many times the console's resolution the host's GPU draws at, 1
@@ -975,6 +1037,16 @@ impl Gpu {
     /// makes guest memory right over a range something other than a draw
     /// is about to read or write, the host GPU keeps what it draws until then.
     pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        self.sync_memory_for(memory, addr, len, "sync");
+    }
+
+    /// sync_memory, saying what for, which the GL waits in the log name.
+    pub fn sync_memory_for<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32, why: &'static str) {
+        self.twins_touch((addr, len), None);
+        #[cfg(feature = "gles")]
+        raster::gles::sync_why(why);
+        #[cfg(not(feature = "gles"))]
+        let _ = why;
         #[cfg(feature = "gles")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.sync(memory, addr, len) {
@@ -986,6 +1058,7 @@ impl Gpu {
     }
 
     pub fn before_overwrite<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
+        self.twins_touch((addr, len), None);
         #[cfg(feature = "gles")]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.before_overwrite(memory, addr, len) {
@@ -1034,6 +1107,9 @@ impl Gpu {
                 break;
             }
 
+            if extra == 0 && matches!(register, REG_DRAW_ARRAYS | REG_DRAW_ELEMENTS) && self.twin_draw(memory, renderer, register, data, mask, &words, index) {
+                continue;
+            }
             self.write_internal(memory, renderer, register, data, mask);
 
             // a burst into one register, uniforms, program words and light
@@ -1047,22 +1123,17 @@ impl Gpu {
                 let end = (index + extra).min(words.len());
                 let burst = &words[index..end];
                 if uniforms {
-                    for &value in burst {
-                        self.vertex_shader.upload_float_uniform(value);
-                    }
+                    self.vertex_shader.upload_float_uniforms(burst);
                 } else if program {
-                    let mirror = self.internal[REG_VS_COM_MODE] & 1 == 0;
-                    for &value in burst {
-                        self.vertex_shader.upload_program(value);
-                        if mirror {
-                            self.geometry_shader.upload_program(value);
-                        }
-                        renderer.upload_shader_code(value);
+                    self.vertex_shader.upload_programs(burst);
+                    if self.internal[REG_VS_COM_MODE] & 1 == 0 {
+                        self.geometry_shader.upload_programs(burst);
                     }
                 } else if table {
                     self.resources.light_tables.write(&mut self.internal, burst);
                 }
                 if let Some(&last) = burst.last() {
+                    self.resources.fragment_state += (FRAGMENT[register] && self.internal[register] != last) as u64;
                     self.internal[register] = last;
                 }
                 index = end;
@@ -1107,6 +1178,170 @@ impl Gpu {
         self.list = words;
         self.flush_immediate(memory);
         self.command_lists += 1;
+    }
+
+    /// draws a draw of a stereo pair into the first eye and leaves its twin
+    /// out, or lets the other eye catch up before any other draw; true when
+    /// the draw needs nothing more.
+    fn twin_draw<M: GpuMemory>(&mut self, memory: &mut M, renderer: &mut dyn Renderer, register: usize, data: u32, mask: u32, words: &[u32], index: usize) -> bool {
+        if std::mem::take(&mut self.twins.skip) {
+            return true;
+        }
+        #[cfg(feature = "gles")]
+        let hardware = self.resources.hardware.is_some();
+        #[cfg(not(feature = "gles"))]
+        let hardware = false;
+        if !hardware || self.twins.off || !self.immediate.vertices.is_empty() {
+            return false;
+        }
+        let here = self.draw_buffers(memory);
+        let pair = self.twin_ahead(memory, words, index, register).and_then(|next| self.twin_pair(here, next));
+        let Some((_, _, first)) = pair else {
+            self.twins_settle();
+            if self.twins.pair.is_some_and(|(first, other, _)| first.iter().chain(&other).any(|&span| here.iter().any(|&drawn| overlap(span, drawn)))) {
+                self.twins.pair = None;
+            }
+            self.twins.fresh.retain(|&(span, _)| !here.iter().any(|&drawn| overlap(span, drawn)));
+            return false;
+        };
+        let kept = (self.internal[REG_COLOR_BUFFER_ADDRESS], self.internal[REG_DEPTH_BUFFER_ADDRESS]);
+        (self.internal[REG_COLOR_BUFFER_ADDRESS], self.internal[REG_DEPTH_BUFFER_ADDRESS]) = (first[0], first[1]);
+        self.write_internal(memory, renderer, register, data, mask);
+        (self.internal[REG_COLOR_BUFFER_ADDRESS], self.internal[REG_DEPTH_BUFFER_ADDRESS]) = kept;
+        (self.twins.skip, self.twins.behind) = (true, true);
+        true
+    }
+
+    /// the colour and depth buffers the registers name.
+    fn draw_buffers<M: GpuMemory>(&self, memory: &M) -> [Span; 2] {
+        let r = &self.internal;
+        let dimensions = r[REG_FRAMEBUFFER_DIMENSIONS];
+        let pixels = (dimensions & 0x7FF) * (((dimensions >> 12) & 0x3FF) + 1);
+        let color = ColorFormat::from_color_buffer((r[REG_COLOR_BUFFER_FORMAT] >> 16) & 7).bytes_per_pixel() as u32;
+        let depth = match r[REG_DEPTH_BUFFER_FORMAT] & 3 {
+            0 => 2,
+            2 => 3,
+            _ => 4,
+        };
+        [(memory.translate(r[REG_COLOR_BUFFER_ADDRESS] << 3), pixels * color), (memory.translate(r[REG_DEPTH_BUFFER_ADDRESS] << 3), pixels * depth)]
+    }
+
+    /// the buffers the next draw goes to, when the commands up to it change
+    /// nothing else: the same draw into other buffers.
+    fn twin_ahead<M: GpuMemory>(&self, memory: &M, words: &[u32], mut index: usize, draw: usize) -> Option<[Span; 2]> {
+        let mut buffers = (self.internal[REG_COLOR_BUFFER_ADDRESS], self.internal[REG_DEPTH_BUFFER_ADDRESS]);
+        // what plain registers hold by the next draw, which must be what
+        // they hold now, a register set and set back changing nothing
+        let mut plain: Vec<(usize, u32)> = Vec::new();
+        let mut uniforms: Option<(u32, Vec<u32>)> = None;
+        let uniform_data = REG_VS_BLOCK + SHADER_UNIFORM_DATA..=REG_VS_BLOCK + SHADER_UNIFORM_DATA_END;
+        let same_uniforms = |uniforms: &Option<(u32, Vec<u32>)>| uniforms.as_ref().is_none_or(|(raw, words)| self.vertex_shader.uploads_nothing_new(*raw, words));
+        while index + 1 < words.len() {
+            let header = words[index + 1];
+            let (register, mask, extra, consecutive) = ((header & 0xFFFF) as usize, (header >> 16) & 0xF, ((header >> 20) & 0xFF) as usize, header & 0x8000_0000 != 0);
+            let values = std::iter::once(words[index]).chain(words[index + 2..(index + 2 + extra).min(words.len())].iter().copied());
+            for (i, value) in values.enumerate() {
+                let register = if consecutive { register + i } else { register };
+                if !uniform_data.contains(&register) && !same_uniforms(&uniforms) {
+                    return None;
+                }
+                if !uniform_data.contains(&register) {
+                    uniforms = None;
+                }
+                let bytes = (0..4).filter(|byte| mask & (1 << byte) != 0).fold(0u32, |bytes, byte| bytes | 0xFF << (byte * 8));
+                let written = |old: u32| (old & !bytes) | (value & bytes);
+                match register {
+                    REG_DRAW_ARRAYS | REG_DRAW_ELEMENTS => {
+                        let here = self.draw_buffers(memory);
+                        let unchanged = plain.iter().all(|&(register, value)| self.internal[register] == value);
+                        return (register == draw && unchanged && buffers != (self.internal[REG_COLOR_BUFFER_ADDRESS], self.internal[REG_DEPTH_BUFFER_ADDRESS]))
+                            .then_some([(memory.translate(buffers.0 << 3), here[0].1), (memory.translate(buffers.1 << 3), here[1].1)]);
+                    }
+                    REG_COLOR_BUFFER_ADDRESS => buffers.0 = written(buffers.0),
+                    REG_DEPTH_BUFFER_ADDRESS => buffers.1 = written(buffers.1),
+                    // the framebuffer flush and invalidate triggers
+                    0x110 | 0x111 => {}
+                    _ if register == REG_VS_BLOCK + SHADER_UNIFORM_INDEX => uniforms = Some((value, Vec::new())),
+                    _ if uniform_data.contains(&register) => match uniforms.as_mut() {
+                        Some((_, words)) => words.push(value),
+                        None => return None,
+                    },
+                    _ if register >= INTERNAL_REGISTER_WORDS => return None,
+                    // a shader unit's settings written again as they are change
+                    // nothing, its uploads always might
+                    _ if ACTS[register] => {
+                        let block = if register >= REG_VS_BLOCK { REG_VS_BLOCK } else { REG_GS_BLOCK };
+                        let in_block = (REG_GS_BLOCK..=REG_GS_BLOCK_END).contains(&register) || (REG_VS_BLOCK..=REG_VS_BLOCK_END).contains(&register);
+                        if !in_block || register - block >= SHADER_UNIFORM_INDEX || written(self.internal[register]) != self.internal[register] {
+                            return None;
+                        }
+                    }
+                    _ => match plain.iter_mut().find(|(at, _)| *at == register) {
+                        Some((_, held)) => *held = written(*held),
+                        None => plain.push((register, written(self.internal[register]))),
+                    },
+                }
+            }
+            index += 2 + extra + extra % 2;
+        }
+        None
+    }
+
+    /// the eyes a draw and its twin go to, the pair already known, or both
+    /// eyes' buffers filled alike since anything drew into them.
+    fn twin_pair(&mut self, here: [Span; 2], next: [Span; 2]) -> Option<([Span; 2], [Span; 2], [u32; 2])> {
+        if let Some((first, other, registers)) = self.twins.pair {
+            return ((here, next) == (first, other) || (here, next) == (other, first)).then_some((first, other, registers));
+        }
+        let filled = |span: Span| self.twins.fresh.iter().find(|&&(fill, _)| fill == span).map(|&(_, value)| value);
+        let alike = |a: Span, b: Span| a != b && filled(a).is_some() && filled(a) == filled(b);
+        if !(alike(here[0], next[0]) && alike(here[1], next[1])) {
+            return None;
+        }
+        #[cfg(feature = "gles")]
+        if !self.resources.hardware.as_ref().is_some_and(|hardware| hardware.can_mirror(here, next)) {
+            return None;
+        }
+        if self.twins.pair.is_none() && !std::mem::replace(&mut self.twins.seen, true) {
+            log::info!("switch: stereo twins, the eyes at {:08X} and {:08X} drawn once", here[0].0, next[0].0);
+        }
+        self.twins.pair = Some((here, next, [self.internal[REG_COLOR_BUFFER_ADDRESS], self.internal[REG_DEPTH_BUFFER_ADDRESS]]));
+        self.twins.fresh.retain(|&(span, _)| !here.iter().chain(&next).any(|&eye| overlap(span, eye)));
+        self.twins.pair
+    }
+
+    /// the other eye takes a copy of the first, the draws it left out.
+    fn twins_settle(&mut self) {
+        if !std::mem::take(&mut self.twins.behind) {
+            return;
+        }
+        let Some((first, other, _)) = self.twins.pair else { return };
+        #[cfg(feature = "gles")]
+        if let Some(hardware) = self.resources.hardware.as_mut() {
+            if let Err(error) = hardware.mirror(first, other) {
+                log::error!("switch: stereo twins off, the other eye could not take a copy, {error}");
+                (self.twins.off, self.twins.pair) = (true, None);
+            }
+        }
+        for (addr, size) in other {
+            self.resources.textures.wrote(addr, size);
+        }
+    }
+
+    /// anything but a draw touching memory: the other eye catches up, and a
+    /// fill over either eye ends the pair, the next fills may start one.
+    fn twins_touch(&mut self, span: Span, fill: Option<u32>) {
+        self.twins_settle();
+        if let Some(value) = fill {
+            if self.twins.pair.is_some_and(|(first, other, _)| first.iter().chain(&other).any(|&eye| overlap(eye, span))) {
+                self.twins.pair = None;
+            }
+            self.twins.fresh.retain(|&(old, _)| !overlap(old, span));
+            self.twins.fresh.push((span, value));
+            if self.twins.fresh.len() > 16 {
+                self.twins.fresh.remove(0);
+            }
+        }
     }
 
     /// decodes the programs a draw runs. the geometry unit gets the vertex
@@ -1361,6 +1596,7 @@ impl Gpu {
         let old = self.internal[register];
         let new = (old & !write_mask) | (value & write_mask);
         self.internal[register] = new;
+        self.resources.fragment_state += (new != old && FRAGMENT[register]) as u64;
         if ACTS[register] {
             self.act(memory, renderer, register, new);
         }
@@ -1430,6 +1666,9 @@ impl Gpu {
             proctex::REG_TABLE_DATA..=proctex::REG_TABLE_DATA_END => {
                 self.resources.proctex_tables.write(&mut self.internal, new);
             }
+            fog::REG_TABLE_DATA..=fog::REG_TABLE_DATA_END => {
+                self.resources.fog_table.write(&mut self.internal, new);
+            }
             REG_GS_BLOCK..=REG_GS_BLOCK_END => {
                 configure_shader(&mut self.geometry_shader, register - REG_GS_BLOCK, new);
             }
@@ -1447,18 +1686,25 @@ impl Gpu {
                 if program && self.internal[REG_VS_COM_MODE] & 1 == 0 {
                     configure_shader(&mut self.geometry_shader, offset, new);
                 }
-                match offset {
-                    SHADER_PROGRAM_DATA..=SHADER_PROGRAM_DATA_END => renderer.upload_shader_code(new),
-                    SHADER_DESCRIPTOR_DATA..=SHADER_DESCRIPTOR_DATA_END => {
-                        renderer.upload_shader_operand_descriptor(new)
-                    }
-                    _ => {}
-                }
             }
             _ => {}
         }
     }
 }
+
+/// the registers the fragment stages' words come from, from the viewport's
+/// depth on to the lighting, short of the vertex stages' from 0x200, but for
+/// where the textures are, how big and in what format, which change from
+/// draw to draw and the words don't hold.
+const FRAGMENT: [bool; 0x300] = {
+    let mut fragment = [false; 0x300];
+    let mut register = 0x040;
+    while register < 0x200 {
+        fragment[register] = !matches!(register, 0x082 | 0x084..=0x08E | 0x092 | 0x094..=0x096 | 0x09A | 0x09C..=0x09E);
+        register += 1;
+    }
+    fragment
+};
 
 /// reads a command buffer as words.
 fn read_command_buffer<M: GpuMemory>(memory: &mut M, paddr: u32, size: u32, words: &mut Vec<u32>) {
@@ -1488,6 +1734,7 @@ const ACTS: [bool; INTERNAL_REGISTER_WORDS] = {
         (REG_FIXED_ATTRIBUTE_INDEX, REG_FIXED_ATTRIBUTE_DATA_END),
         (lighting::REG_TABLE_DATA, lighting::REG_TABLE_DATA_END),
         (proctex::REG_TABLE_DATA, proctex::REG_TABLE_DATA_END),
+        (fog::REG_TABLE_DATA, fog::REG_TABLE_DATA_END),
         (REG_GS_BLOCK, REG_GS_BLOCK_END),
         (REG_VS_BLOCK, REG_VS_BLOCK_END),
     ];

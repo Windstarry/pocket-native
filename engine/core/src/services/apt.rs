@@ -208,10 +208,21 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             );
             true
         }
-        // IsRegistered -> true, so a title believes the applet it asked about
-        // exists.
+        // IsRegistered(app id) -> true, so a title believes the applet it
+        // asked about exists. a library applet is there only while the
+        // title prepares or runs it: a title told one is there cancels it
+        // and waits for it to close, Yo-kai Watch 2 as it starts, and one
+        // told its applet is there already skips preparing it and waits
+        // for an answer, Kirby: Triple Deluxe and the Mii selector
         0x0009 => {
-            buffer.reply(&mut system.memory, 0x0009, &[1]);
+            let applet = buffer.get(&mut system.memory, 1);
+            let apt = &system.services.apt;
+            let running = apt.library_applet.or(apt.keyboard.as_ref().map(|_| super::keyboard::APPLET_ID));
+            let registered = match applet & 0xF00 {
+                0x200 | 0x400 => running.is_some_and(|running| applet & 0xFF == 0 || running & 0xFF == applet & 0xFF),
+                _ => true,
+            };
+            buffer.reply(&mut system.memory, 0x0009, &[registered as u32]);
             true
         }
         // InquireNotification -> no pending notification.
@@ -298,9 +309,10 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
             true
         }
         // StartLibraryApplet(applet id, size, handle, buffer). the keyboard
-        // stays open until the frontend answers for it, any other applet
-        // closes as soon as it starts and hands back a blank result the size
-        // of what it was given, which is what Citra's applets do.
+        // stays open until the frontend answers for it, the Mii selector
+        // picks the console's Mii and any other applet closes as soon as it
+        // starts and hands back a blank result the size of what it was
+        // given, which is what Citra's applets do.
         0x001E => {
             let applet = buffer.get(&mut system.memory, 1);
             let size = buffer.get(&mut system.memory, 2);
@@ -313,10 +325,16 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                 buffer.reply(&mut system.memory, command, &[]);
                 return true;
             }
-            log::info!(
-                "apt: library applet 0x{applet:03X} started with {} bytes, closing it right away",
-                data.len()
-            );
+            let result = if super::mii_selector::APPLET_IDS.contains(&applet) {
+                log::info!("apt: the Mii selector picks the console's Mii");
+                super::mii_selector::result()
+            } else {
+                log::info!(
+                    "apt: library applet 0x{applet:03X} started with {} bytes, closing it right away",
+                    data.len()
+                );
+                vec![0; data.len()]
+            };
             system.services.apt.library_applet = None;
             send_parameter(
                 system,
@@ -324,7 +342,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
                     sender: applet,
                     destination: APPLICATION,
                     signal: SIGNAL_WAKEUP_BY_EXIT,
-                    buffer: vec![0; data.len()],
+                    buffer: result,
                     object: None,
                 },
             );

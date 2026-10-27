@@ -1,160 +1,260 @@
 # Start here
 
-Pocket Native does not work like an emulator. There is no app to install
-on the handheld and no game included. A PC rebuilds your own game dumps
-into a folder for the SD card, and that is the part most people miss.
+Pocket Native doesn't come with games, and it doesn't play your game
+files directly. Your PC rebuilds each of your 3DS games into a program
+made for your device first. Then:
 
-The whole thing in one line: download the kit, drop your game on
-`Build a game`, and copy the folder it makes to the card.
+- on a **Linux handheld** (R36S and friends) you copy what the PC made
+  onto the SD card
+- on **Android** you install the app and add what the PC made to it
 
-Tested and tuned: Pokémon Omega Ruby and Alpha Sapphire, Animal
-Crossing: New Leaf and Mario Kart 7 (the US versions of those two).
-Other games may or may not boot.
+Essentially: get the kit, drop your games on `Build a game`, then copy
+the `Pocket Native` folder it makes to your handheld's card or add it in
+the Android app.
+
+Before you start, check [which games work](docs/compatibility.md) and
+[which devices](README.md#handhelds).
 
 ## What you need
 
-- An R36S (or a close clone) with ArkOS. dArkOSRE works too. Other
-  systems, dArkOS included, are untested.
-- A PC for the build, with Windows or Linux:
-  - Windows: Docker Desktop or Podman Desktop, running before you
-    start. If neither is installed, the build offers to install Docker
-    Desktop for you.
+- **A device:**
+  - a Linux handheld from the [list](README.md#handhelds), or
+  - an Android phone or handheld with Android 11 or newer, 64-bit (almost
+    any from the last few years)
+- **A PC** with Windows or Linux. It does the heavy work, your device
+  never builds anything.
+  - Windows: Docker Desktop or Podman Desktop. If neither is
+    installed, the build offers to install Docker Desktop for you.
   - Linux: podman or Docker.
-- Your own dump of the game: a decrypted `.3ds`/`.cci`, or a `.cia`
-  along with your console's `aes_keys.txt`.
+  - Free space: a few GB for the build container, and two to three
+    times each game's size for each game you build.
+- **Your own games**, dumped from your own console: a decrypted
+  `.3ds`/`.cci`, or a `.cia` along with your console's `aes_keys.txt`.
+  Any region works.
 
-## Getting the kit
+## 1. Get the kit
 
 Open the [latest release](https://github.com/whovian64/pocket-native/releases/latest),
-download **Source code (zip)** under Assets, and unzip it somewhere with
-a few GB to spare. The folder you get is the kit, and everything below
-happens in it. You only do this once: later versions come in through
-the updater.
+download **Source code (zip)** under Assets, and unzip it somewhere.
+The folder you get is the kit: everything below happens in it. You only
+do this once, later versions come in through the updater.
 
-## Building
+## 2. Build your games
 
-On Windows, drag your game onto `Build a game.bat` in the kit's folder,
-or double-click it and pick the game. On Linux, do the same with
-`Build a game`. Several games can go at once. The first time, Windows or
-the file manager may ask whether to run it, see below if it does.
+This step is the same for every device.
 
-A `.cia` needs your console's `aes_keys.txt`. Put it next to the game
-or in the kit's folder and the build finds it, otherwise it asks for it.
+**Windows:** start Docker Desktop (or Podman Desktop) and let it finish
+starting. Then drag your games onto `Build a game.bat`, or double-click
+it and pick them.
 
-A window shows the build as it goes and stays open at the end, so you
-can read how it went. The first build sets up the build container,
-which downloads a few hundred MB and takes a while. Each game's code is
-recompiled, which takes several minutes for a big game. Later builds
-reuse what they can.
+**Linux:** drag your games onto `Build a game`, or open it and pick
+them.
 
-The result is a `Pocket Native` folder in the kit's `build` folder.
-Building more games adds them to it, one launcher each. A game with no
-profile yet builds with `(no profile yet)` after its name and is named
-after its title ID.
+Several games can go at once. A `.cia` needs your console's
+`aes_keys.txt`: put it next to the game or in the kit's folder and the
+build finds it, otherwise it asks.
 
-From a terminal, in the kit's folder, the same build is:
+A window shows the build as it goes and stays open at the end so you
+can read how it went. The very first build sets up the build container,
+which downloads a few hundred MB and takes a while. After that, each
+game takes a few minutes, most of it recompiling the game's code.
+
+When it's done, the kit's `build` folder holds a `Pocket Native` folder
+with your games in it. Building more games later adds them to the same
+folder.
+
+Prefer a terminal? In the kit's folder:
 
 ```bash
-scripts/build.sh path/to/game.3ds
+scripts/build.sh path/to/game.3ds path/to/other.cia --keys path/to/aes_keys.txt
 ```
 
-and `scripts\build.ps1` in PowerShell on Windows. Both take several
-games at once, and `--keys path/to/aes_keys.txt` (`-Keys` on Windows)
-for a `.cia` whose keys are elsewhere.
+or `scripts\build.ps1` in PowerShell on Windows (`-Keys` for the keys).
 
-## Installing
+## 3. Put the games on your device
 
-The build leaves a folder called `Pocket Native` in `build`. Inside it
-are two parts, and they have to stay together:
+### On a Linux handheld
 
-- one `.sh` file per game, named after the game. That file is the
-  launcher, and it is what EmulationStation lists.
-- a folder called `pocket-native`, with the program and the games in
-  it. The launcher starts the copy of `pocket-native` beside it, so
-  neither part works on its own.
+Put the handheld's SD card in your PC and copy the **whole**
+`Pocket Native` folder from `build` into the folder your system keeps
+ports in:
 
-1. Copy the whole `Pocket Native` folder, as it is, into `ports` on
-   the card's game partition: `roms/ports`, or `roms2/ports` with two
-   cards. The result should look like this:
+| System | Where it goes |
+|---|---|
+| ArkOS, dArkOS, dArkOSRE | `roms/ports`, or `roms2/ports` with two cards |
+| Knulli | `roms/ports` on the SHARE partition |
+| muOS | `ROMS/Ports` |
 
-   ```
-   roms/ports/Pocket Native/Pokémon Omega Ruby.sh
-   roms/ports/Pocket Native/pocket-native/
-   ```
+On ArkOS it ends up like this:
 
-   Do not copy the `build` folder itself, do not copy just one part,
-   and do not rename anything or move files between the two parts.
-2. Put the card back in the handheld and restart EmulationStation.
-3. Each game shows up under Ports, named after the game, one entry
-   per `.sh` file.
+```
+roms/ports/Pocket Native/Pokémon Omega Ruby.sh
+roms/ports/Pocket Native/pocket-native/
+```
 
-Building another game later adds its `.sh` file and its game files to
-the same output folder. Copy the folder to the card again and let it
-overwrite and merge, so the new game arrives whole.
+The `.sh` files are the launchers, one per game, and `pocket-native`
+holds the program and the games. They only work together, so copy the
+folder as it is: don't rename anything or move files between the two.
 
-If a game is missing from Ports, count the `.sh` files where you
-copied the folder: there should be one per game, sitting directly in
-`Pocket Native`, not inside `pocket-native`. If a game is listed but
-does not start, the folder arrived in pieces: delete it from the card
-and copy the whole folder again.
+Put the card back, restart the handheld's frontend (EmulationStation on
+ArkOS), and your games are under Ports.
 
-A tap of FN opens the menu in game and pauses it, FN + Start quits. On a handheld with no FN, press L3 and R2 together for the menu.
-Saves and the game's log go in
-`Pocket Native/pocket-native/games/<title id>/data`.
+### On Android
+
+1. **Install the app.** Download the `.apk` under Assets on the
+   [latest release](https://github.com/whovian64/pocket-native/releases/latest)
+   onto the device and open it. The first time, Android asks you to
+   allow installing apps from your browser or file manager.
+2. **Copy your games over.** Copy the `Pocket Native` folder from the
+   kit's `build` folder onto the device, for example into `Download`
+   over USB.
+3. **Add them in the app.** Tap **Add game**, pick **A folder the kit
+   built**, choose that `Pocket Native` folder, tap **Use this folder**
+   and **Allow**. The app adds every game it finds in there, so one go
+   does them all.
+
+The app keeps its own copy of each game, so you can delete the one in
+`Download` afterwards.
+
+Uninstalling the app deletes the games and saves it holds, Android
+removes an app's folder along with it. To update, install a newer
+`.apk` over the old one instead.
+
+## 4. Play
+
+**The first start of each game is slow.** It builds the GPU programs
+the game needs, which can take a few minutes with a black screen or a
+stuttering title screen. Let it run. The next start reuses them, and
+any that were still missing get built as you play.
+
+### On a Linux handheld
+
+The buttons you need right away:
+
+- **A tap of FN** opens the menu and pauses the game. No FN button? Press
+  **L3 and R2** together.
+- **FN + Start** quits (**L3 + Start** without FN).
+- The **right stick** moves a cursor over the bottom screen, **R2**
+  touches it.
+
+The full list of controls is in the [README](README.md#controls).
+
+### On Android
+
+Tap a game to play it. Touch controls cover everything, and a gamepad
+works too: the touch controls hide while you use one and come back when
+you touch the screen.
+
+- The on-screen **Menu** button, or **Back**, opens the menu.
+- **Controls > Edit touch controls** in the menu lets you drag the
+  buttons and sticks where you want them and make them bigger or
+  smaller, separately for holding the device upright and sideways.
+- **Device**, at the top right of the app, sets the orientation, touch
+  controls, aspect ratio, resolution and smooth scaling for every game,
+  and on a handheld with two screens (AYN Thor, RG DS) whether the
+  bottom screen goes on the second one.
+- Long-press a game to put it on your home screen, with launchers that
+  take shortcuts.
+
+### The menu
+
+The menu has a line of help for each setting at the bottom. The ones
+worth knowing first:
+
+- **Performance > Frame cap:** 30 fps by default, which is what most
+  3DS games run at. 60 is there for the games made for 60.
+- **Display > Layout:** both screens, one big screen, side by side and
+  more. FN + R1 switches between both screens and one big one in game
+  on a Linux handheld.
+- **This game:** options for that game, where it has any.
+- **Advanced settings > Most compatible:** for a game that crashes or
+  looks wrong, then **Restart game**. If that fixes it, the setting
+  that broke it is one of the ones it turned off.
 
 ## Updating
 
-When a new version is out, the build says so when it finishes. Open
+When a new version is out, the build tells you when it finishes. Open
 `Update Pocket Native` in the kit's folder (`Update Pocket Native.bat`
-on Windows). It downloads the new version into the kit, keeps the old
-files in `.old`, and builds every game in `build` again from the copies
-the last build kept there, so you don't need your game files for it.
-Then copy the `Pocket Native` folder onto the card again, over the old
-one. Your saves stay where they are.
+on Windows): it downloads the new version into the kit, builds every
+game in `build` again from the copies the last build kept, so you
+don't need your game files for it, and keeps the old files in `.old`.
 
-The menu shows which version you are running, next to "Pocket Native"
-at the top.
+Then:
 
-Coming from 0.1.0 or 0.1.1, which have no updater yet: get the new kit
-as above, build your games with it, and copy the folder over the old
-one on the card. From then on the updater does it.
+- **Linux handheld:** copy the `Pocket Native` folder onto the card
+  again, over the old one.
+- **Android:** install the new `.apk` from the release, then add the
+  rebuilt `Pocket Native` folder in the app again. A game added again
+  keeps its saves and settings.
 
-## If it goes wrong
+The menu shows which version you're running, at the top.
+
+## If something goes wrong
 
 **Windows says it protected your PC, or asks whether to run the file.**
-It does that for files that came from the internet. Click **More info**
-and then **Run anyway**, or **Run**.
+It does that for anything from the internet. Click **More info**, then
+**Run anyway**.
 
 **Nothing happens when you open `Build a game` on Linux.** The file
-manager does not run launchers it does not trust. Allow it when it
-asks, or in the file's properties (allow executing, or allow
-launching), or run `scripts/build.sh` from a terminal instead.
+manager doesn't run launchers it doesn't trust yet. Allow it when it
+asks, or in the file's properties, or run `scripts/build.sh` from a
+terminal.
 
-**The build says the image is encrypted.** The dump has to be decrypted
-first, or built from the `.cia` with its `aes_keys.txt` instead.
+**The Windows build can't reach Docker.** Docker Desktop isn't running.
+Start it, wait until it says it's running, and build again.
 
-**The Windows build cannot reach Docker.** Docker Desktop is not
-running. Start it, let it finish starting, and run the build again.
+**The build says the game is encrypted.** Decrypt the dump first, or
+build it from the `.cia` with your `aes_keys.txt`.
 
-**The update says it could not reach GitHub.** Check the PC's internet
-connection and try again, or get the new kit by hand as above.
+**The update can't reach GitHub.** Check the PC's connection and try
+again, or get the new kit by hand as in step 1.
 
-**The game is not under Ports.** The folder is in the wrong place, or
-EmulationStation has not been restarted. The whole `Pocket Native`
-folder goes inside `ports`, not just the files in it. If it still does
-not show up, your system may only list launchers sitting directly in
-`ports`: move the `.sh` files and the `pocket-native` folder out of
-`Pocket Native` into `ports` itself, side by side.
+**The game isn't under Ports.** The folder is in the wrong place, or
+the frontend hasn't been restarted. The whole `Pocket Native` folder
+goes inside the ports folder. If it still doesn't show, your system may
+only list launchers sitting directly in the ports folder: move the
+`.sh` files and the `pocket-native` folder out of `Pocket Native`,
+side by side into the ports folder itself.
 
-**A black screen with choppy sound, and FN pauses but shows no menu.**
-The handheld's GPU did not start, so the game is drawing in software,
-far too slowly to show anything. No setting fixes that. Builds before
-0.1.1 did this on dArkOS and dArkOSRE, so build the game again with the
-current version. If it still happens, the game's `log.txt` has a line
-with `could not initialize EGL`, please post it in an issue.
+**The game is listed but won't start.** The folder arrived in pieces.
+Delete it from the card and copy the whole folder again.
 
-**A game that is not one of the tested ones does not start, or runs
-badly.** That is expected for now. Its `log.txt`, in the game's
-`data` folder above, says what the emulator ran into. Most games have
-something worth trying first: open the menu, go to **Advanced
-settings**, pick **Most compatible**, then **Restart game**.
+**The Android app says there's no game there.** Pick the `Pocket
+Native` folder the kit made, the one with `pocket-native` inside.
+Games built with a kit from 0.3.0 or before don't load on Android:
+update the kit and build them again.
+
+**A black screen for minutes on the first start.** Usually the GPU
+programs being built, see step 4. If it never comes up, look in the
+game's `log.txt`. On a Linux handheld, a line with
+`could not initialize EGL` means the GPU didn't start for Pocket
+Native, please report it.
+
+**A game crashes, freezes or looks wrong.** Try **Advanced settings >
+Most compatible** and **Restart game** first. The
+[compatibility list](docs/compatibility.md) says what's known for each
+game.
+
+## Reporting a problem
+
+Open an [issue](https://github.com/whovian64/pocket-native/issues) and
+say:
+
+- the device and the system on it (ArkOS, Knulli, muOS, Android ...)
+- the game, and which region
+- the Pocket Native version, from the top of the menu
+- what happened, and where in the game
+
+and attach the game's `log.txt`:
+
+- **Linux handheld:** `Pocket Native/pocket-native/games/<title id>/data/log.txt`
+  on the card
+- **Android:** `Android/data/io.github.pocketnative/files/games/<title id>/data/log.txt`.
+  Plug the device into a PC to get at it, many file managers can't
+  open `Android/data`.
+
+Copy it off right after the problem, the next start of that game
+replaces it.
+
+A game that works is worth an issue too, it goes on the
+[compatibility list](docs/compatibility.md).
