@@ -14,10 +14,6 @@ pub struct Profile {
     /// the advanced settings the game needs, until the player changes them.
     #[serde(default)]
     pub advanced: Option<crate::settings::Advanced>,
-    /// bottom screen skipping comes back after it went off, for a game
-    /// that sends a bottom sized picture to the top only at its start.
-    #[serde(default)]
-    pub bottom_relearn: bool,
 }
 
 /// an option the menu turns on and off.

@@ -774,6 +774,13 @@ pub struct Resources {
     /// the host GPU, when draws go to it rather than to the software path.
     #[cfg(feature = "gles")]
     pub(crate) hardware: Option<HostRenderer>,
+    /// the colour buffers the top screen's last pictures came from.
+    #[cfg(feature = "gles")]
+    pub(crate) shown_top: [u32; 4],
+    /// what the bottom screen was last shown from, while the title draws it
+    /// again for every picture.
+    #[cfg(feature = "gles")]
+    pub(crate) redrawn_bottom: Option<(u32, u32)>,
 }
 
 /// in fast mode, index buffers and vertex arrays as draws read them, kept
@@ -875,6 +882,8 @@ struct Decoded {
 
 /// set by a renderer whose GPU samples ETC1 itself.
 pub(crate) static SAMPLES_ETC1: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// whether ETC1A4 goes to it so too, its alpha a texture apart.
+pub(crate) static SAMPLES_ETC1A4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// how many texels the cache holds before it starts over, 256 MiB of them.
 const CACHED_TEXELS: usize = 64 * 1024 * 1024;
@@ -951,7 +960,11 @@ impl TextureCache {
         let packed = packs
             .then(|| crate::texture::pack_texels(data, format, width, height))
             .flatten()
-            .filter(|&(packing, _)| !matches!(packing, crate::texture::Packing::Etc1 | crate::texture::Packing::Etc1A4) || SAMPLES_ETC1.load(std::sync::atomic::Ordering::Relaxed))
+            .filter(|&(packing, _)| match packing {
+                crate::texture::Packing::Etc1 => SAMPLES_ETC1.load(std::sync::atomic::Ordering::Relaxed),
+                crate::texture::Packing::Etc1A4 => SAMPLES_ETC1A4.load(std::sync::atomic::Ordering::Relaxed),
+                _ => true,
+            })
             .map(|(packing, bytes)| (packing, Arc::from(bytes)));
         let texels: Arc<[[u8; 4]]> = match packed {
             Some(_) => Arc::from([]),
@@ -1624,6 +1637,7 @@ impl DrawState<'_> {
             fog_table: self.fog_table,
             fragment_state: self.fragment_state,
             stand_in: false,
+            skippable: false,
         }
     }
 }
@@ -2151,6 +2165,9 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
 
     let color_buffer_raw = loc_register(registers, REG_COLOR_BUFFER_ADDRESS);
     let target_addr = memory.translate(color_buffer_raw);
+    #[cfg(feature = "gles")]
+    let skippable = viewport_height == 400.0 && resources.shown_top.contains(&target_addr)
+        || viewport_height == 320.0 && resources.redrawn_bottom.is_some_and(|(start, end)| start < target_addr.saturating_add(240 * 320 * 4) && target_addr < end);
     // the format sits in bits 16-18 of the register, not the low bits, the low
     // half holds how many bytes a pixel takes.
     let target_format = ColorFormat::from_color_buffer((registers[REG_COLOR_BUFFER_FORMAT] >> 16) & 7);
@@ -2303,6 +2320,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
             match hardware.draw(memory, &state.hardware(registers, host::Geometry::Shaded(&shading))) {
                 Ok(()) => return (indices.len() / 3) as u32,
                 Err(_) if fetched.is_some() => return NOT_FETCHED,
+                Err(error) if error == gles::COMPILING && skippable => return 0,
                 Err(error) if error == gles::COMPILING => compiling = true,
                 Err(error) if first_time(&error) => log::error!("the GPU could not shade, {error}, shading on the CPU"),
                 Err(_) => {}
@@ -2353,6 +2371,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
             let mut draw = state.hardware(registers, host::Geometry::Triangles(&triangles));
             draw.stand_in = compiling;
+            draw.skippable = skippable;
             match hardware.draw(memory, &draw) {
                 Ok(()) => return triangle_count as u32,
                 Err(error) if first_time(&error) => log::error!("the GPU could not draw, {error}, drawing in software"),

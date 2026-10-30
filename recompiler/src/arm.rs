@@ -5,7 +5,7 @@
 /// the condition field value meaning always.
 pub const ALWAYS: u32 = 0xE;
 const PC: u32 = 15;
-const LR: u32 = 14;
+pub const LR: u32 = 14;
 const SP: u32 = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,21 @@ pub fn compare_immediate(word: u32) -> Option<(u32, u32)> {
     }
     let rotate = ((word >> 8) & 0xF) * 2;
     Some(((word >> 16) & 0xF, (word & 0xFF).rotate_right(rotate)))
+}
+
+/// the register and value of add or sub rd, pc, imm or mov rd, pc, which
+/// stubs into Thumb and calls that set lr by hand put addresses in with.
+pub fn pc_relative(word: u32, address: u32) -> Option<(u32, u32)> {
+    let pc = address.wrapping_add(8);
+    let rd = (word >> 12) & 0xF;
+    let value = (word & 0xFF).rotate_right(((word >> 8) & 0xF) * 2);
+    match word & 0xFFFF_0000 {
+        _ if word & 0xFFFF_0FFF == 0xE1A0_000F => Some((rd, pc)),
+        0xE28F_0000 => Some((rd, pc.wrapping_add(value))),
+        0xE24F_0000 => Some((rd, pc.wrapping_sub(value))),
+        _ => None,
+    }
+    .filter(|&(rd, _)| rd != PC)
 }
 
 fn sign_extend_24(value: u32) -> i32 {

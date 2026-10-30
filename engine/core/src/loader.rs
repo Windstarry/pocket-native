@@ -24,31 +24,35 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
     log::info!("loaded {}", title.describe());
 
     let exheader = &title.exheader;
-    let app_bytes = exheader.system_mode.application_memory();
     let region = match exheader.memory_type {
         MemoryType::Application => memory::MemoryRegion::Application,
         MemoryType::System => memory::MemoryRegion::System,
         MemoryType::Base => memory::MemoryRegion::Base,
     };
 
-    // a title marked New3DS-only has to run as one, and a New 3DS is one
-    // all the way through
-    if title.ncch.platform() == 2 {
-        config.new3ds = true;
-    }
+    // a title marked New3DS-only has to run as one, one with a New3DS
+    // system mode runs as one with that mode's memory when the player asks,
+    // and the rest as on an Old 3DS, as their linear heap is where an Old
+    // 3DS has it; a New 3DS is one all the way through
+    let n3ds_memory = zakuro_fs::n3ds_application_memory(exheader.n3ds_system_mode);
+    config.new3ds = title.ncch.platform() == 2 || config.new3ds && n3ds_memory.is_some();
     if config.new3ds {
         config.model = ConsoleModel::New3ds;
     }
+    let (app_bytes, app_mem_type) = match n3ds_memory {
+        Some(memory) if config.new3ds => memory,
+        _ => (exheader.system_mode.application_memory(), exheader.system_mode as u32),
+    };
 
     let mut system = System::new(config);
-    system.memory = memory::Memory::new(system.config.new3ds, app_bytes);
+    system.memory = memory::Memory::new(system.config.new3ds, app_bytes).with_linear_base(linear_heap_base(system.config.new3ds));
     system.kernel = crate::kernel::Kernel::new(
         title.program_id(),
         region,
         linear_heap_base(system.config.new3ds),
     );
 
-    map_special_pages(&mut system, app_bytes);
+    map_special_pages(&mut system, app_bytes, app_mem_type);
     map_code(&mut system, &title)?;
     map_stack(&mut system, exheader.stack_size);
 
@@ -147,11 +151,8 @@ fn installed(system: &System, title: &Title) -> Option<std::path::PathBuf> {
     found
 }
 
-fn map_special_pages(system: &mut System, app_bytes: u32) {
+fn map_special_pages(system: &mut System, app_bytes: u32, app_mem_type: u32) {
     let model = system.config.model;
-    let app_mem_type = system.title.as_ref().map_or(0, |t| {
-        t.exheader.system_mode as u32
-    });
     let sys = system
         .memory
         .phys

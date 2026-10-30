@@ -66,6 +66,15 @@ impl Busy {
                 out.push(if mhz > 0 { format!("GPU {}% at {} MHz", sum / count, mhz / count) } else { format!("GPU {}%", sum / count) });
             }
         }
+        // what the game holds of the memory and what the system has left,
+        // the driver's memory counted in the first on a handheld
+        let resident = std::fs::read_to_string("/proc/self/statm").ok().and_then(|statm| statm.split_whitespace().nth(1)?.parse::<u64>().ok());
+        let available = std::fs::read_to_string("/proc/meminfo").ok().and_then(|info| info.lines().find_map(|line| line.strip_prefix("MemAvailable:")?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()));
+        if let (Some(pages), Some(kib)) = (resident, available) {
+            // SAFETY: a plain query
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+            out.push(format!("memory {} MiB, {} MiB free", pages * page >> 20, kib >> 10));
+        }
         out.join(", ")
     }
 }

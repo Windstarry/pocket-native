@@ -1,6 +1,7 @@
 #!/bin/sh
-# power.sh saver|balanced|performance: the CPU, GPU and memory speeds for
-# Pocket Native's Power setting
+# power.sh saver|balanced|performance|normal: the CPU, GPU and memory speeds
+# for Pocket Native's Power setting, normal as the system keeps them, for after
+# a game
 cpu=/sys/devices/system/cpu/cpufreq/policy0
 gpu=$(ls -d /sys/devices/platform/*.gpu/devfreq/*.gpu 2>/dev/null | head -1)
 dmc=/sys/devices/platform/dmc/devfreq/dmc
@@ -9,6 +10,9 @@ set_to() { if [ "$(id -u)" = 0 ]; then echo "$2" > "$1"; else echo "$2" | sudo -
 
 case "$1" in
     performance) governors="performance performance performance" ;;
+    # the GPU left on demand stayed slow enough to hold Pokémon X at 16 fps,
+    # at its top speed 30, the CPU slowing down where it can all the same
+    balanced) governors="ondemand performance performance" ;;
     *) governors="ondemand simple_ondemand dmc_ondemand" ;;
 esac
 set -- "$1" $governors

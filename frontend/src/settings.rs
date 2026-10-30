@@ -245,6 +245,8 @@ pub struct Advanced {
     pub past_drawing: bool,
     /// ETC1 textures kept compressed for the GPU.
     pub etc1: bool,
+    /// ETC1A4 kept so too, its alpha a texture apart.
+    pub etc1a4: bool,
     pub generic_shaders: bool,
     pub generic_lighting: bool,
     /// indexed draws given the range of vertices they use.
@@ -263,6 +265,8 @@ pub struct Advanced {
     /// new shaders compiled on a thread of their own, draws going on with
     /// stand-ins meanwhile.
     pub background_shaders: bool,
+    /// a game with a New 3DS mode run as on a New 3DS.
+    pub new3ds: bool,
 }
 
 impl Default for Advanced {
@@ -290,6 +294,7 @@ impl Default for Advanced {
             in_place: true,
             past_drawing: true,
             etc1: true,
+            etc1a4: true,
             generic_shaders: false,
             generic_lighting: false,
             draw_ranges: true,
@@ -300,6 +305,7 @@ impl Default for Advanced {
             prewarm: true,
             read_ahead: true,
             background_shaders: true,
+            new3ds: false,
         }
     }
 }
@@ -357,6 +363,7 @@ impl Advanced {
             ("ZAKURO_NO_IN_PLACE", !self.in_place),
             ("ZAKURO_NO_PAST_DRAWING", !self.past_drawing),
             ("ZAKURO_NO_ETC1", !self.etc1),
+            ("ZAKURO_NO_ETC1A4", !self.etc1a4),
             ("ZAKURO_GENERIC_SHADERS", self.generic_shaders),
             ("ZAKURO_GENERIC_LIGHTING", self.generic_lighting),
             ("ZAKURO_NO_RANGE", !self.draw_ranges),

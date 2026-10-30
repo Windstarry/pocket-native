@@ -69,6 +69,7 @@ restore() {
     [ -n "$es" ] && kill -CONT $es 2>/dev/null
     sudo -n systemctl restart oga_events >/dev/null 2>&1 &
     if [ "$tune" != 0 ]; then
+        "$dir/power.sh" normal
         [ -n "$old_swappiness" ] && sw /proc/sys/vm/swappiness "$old_swappiness"
         if [ -n "$zram" ]; then
             sudo -n swapoff /dev/zram0 2>/dev/null

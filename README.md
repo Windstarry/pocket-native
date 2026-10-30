@@ -6,6 +6,9 @@ instead of emulated.
 **[Start here](START_HERE.md)** to play · [Which games work](docs/compatibility.md) ·
 [Latest release](https://github.com/whovian64/pocket-native/releases/latest)
 
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/fZ7Q9hmWCd)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/whovian64)
+
 ## Now on Android
 
 Pocket Native now runs on Android too, on one screen or two, thanks to
@@ -146,7 +149,7 @@ details. It's off by default.
 | `frontend/` | The `pocket-native` program: panel, input, sound, menu, probe |
 | `titles/<title id>/` | Per-game profiles and hand-written code overrides |
 | `scripts/` | The kit's build (`build.sh`, `container/`) and what runs on the handheld (`device/`) |
-| `tools/` | Build helpers: title IDs, `.cia` decryption, the system font, licenses |
+| `tools/` | Build helpers: title IDs, `.cia` and `.3ds` decryption, the system font, licenses |
 
 Pocket Native builds and runs on a Linux PC too, with Mesa's OpenGL ES:
 

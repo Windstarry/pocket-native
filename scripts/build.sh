@@ -2,8 +2,9 @@
 # build.sh <rom>... [--keys aes_keys.txt] [--out dir] [--wait]
 #
 # Builds Pocket Native and games for the handheld from your own ROMs,
-# decrypted .3ds/.cci files or .cia files with your console's aes_keys.txt,
-# inside a container (podman or docker). With no ROM it asks for them, and
+# .3ds/.cci or .cia files, compressed (.zcci/.zcia) or not, with your
+# console's aes_keys.txt where they are encrypted, inside a container
+# (podman or docker). With no ROM it asks for them, and
 # --wait waits for Enter at the end. Leaves "Pocket Native" in the output
 # directory, build/ by default, to copy into roms/ports on the card.
 set -euo pipefail
@@ -31,7 +32,7 @@ pick() {
 }
 
 if [ ${#roms[@]} -eq 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
-    mapfile -t roms < <(pick "Pick the games to build" "3DS games" "*.3ds *.cci *.cia *.3DS *.CCI *.CIA" many || true)
+    mapfile -t roms < <(pick "Pick the games to build" "3DS games" "*.3ds *.cci *.cia *.zcci *.zcia *.3DS *.CCI *.CIA *.ZCCI *.ZCIA" many || true)
     [ ${#roms[@]} -eq 0 ] && { echo "no game picked"; exit 2; }
 fi
 if [ ${#roms[@]} -eq 0 ]; then
@@ -53,16 +54,16 @@ user=(--user "$(id -u):$(id -g)")
 [ "$(basename "$engine")" = podman ] && user=(--userns=keep-id)
 failed=()
 for rom in "${roms[@]}"; do
-    mounts=(-v "$repo:/src:ro" -v "$out/.work:/work" -v "$out:/out" -v "$(dirname "$rom"):/rom:ro")
+    mounts=(-v "$repo:/src:ro,Z" -v "$out/.work:/work" -v "$out:/out" -v "$(dirname "$rom"):/rom:ro,Z")
     args=("/rom/$(basename "$rom")")
-    # a .cia takes the keys given, else the aes_keys.txt beside it or in the
-    # kit, else the one picked when asked
+    # a game takes the keys given, else the aes_keys.txt beside it or in the
+    # kit, for an encrypted one, and a .cia else the one picked when asked
     rom_keys="$keys"
-    if [ -z "$rom_keys" ] && [[ "${rom,,}" == *.cia ]]; then
+    if [ -z "$rom_keys" ]; then
         for near in "$(dirname "$rom")/aes_keys.txt" "$repo/aes_keys.txt"; do
             [ -f "$near" ] && { rom_keys="$near"; break; }
         done
-        if [ -z "$rom_keys" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        if [ -z "$rom_keys" ] && [[ "${rom,,}" == *.cia || "${rom,,}" == *.zcia ]] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
             keys=$(pick "A .cia needs your console's aes_keys.txt, pick it" "aes_keys.txt" "aes_keys.txt *.txt" || true)
             rom_keys="$keys"
         fi

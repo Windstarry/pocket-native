@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Convert a CIA (plain content layer) into a decrypted .3ds (NCSD/CCI).
+"""Convert a CIA (plain content layer), or an encrypted .3ds/.cci, into a
+decrypted .3ds (NCSD/CCI).
 
-usage: cia2cci.py in.cia out.3ds [aes_keys.txt]
+usage: cia2cci.py in.cia|in.3ds out.3ds [aes_keys.txt]
 Input is only read. NCCH crypto handled: original (0x2C) and 7.x (0x25),
-9.3 (0x18), 9.6 (0x1B); seeded titles are rejected.
+9.3 (0x18), 9.6 (0x1B); seeded titles are rejected. A partition already
+decrypted by a tool that left its crypto flag set only has the flag fixed,
+and needs no keys.
 """
 import os
 import struct
@@ -13,6 +16,7 @@ from Cryptodome.Cipher import AES
 from Cryptodome.Util import Counter
 
 MU = 0x200
+PLAIN = (b".code", b"banner", b"icon", b"logo")
 CHUNK = 16 << 20
 M128 = (1 << 128) - 1
 
@@ -71,15 +75,11 @@ def copy_region(src, dst, s_off, d_off, size, cipher=None):
         size -= n
 
 
-def decrypt_ncch(src, dst, s_base, d_base, size, keys):
-    src.seek(s_base)
-    hdr = bytearray(src.read(0x200))
-    assert hdr[0x100:0x104] == b"NCCH", "no NCCH"
-    copy_region(src, dst, s_base, d_base, size)
-    if hdr[0x18F] & 0x04:
-        return
+def decrypt_contents(src, dst, s_base, d_base, hdr, keys):
     if hdr[0x18F] & 0x20:
         sys.exit("seeded NCCH (needs seeddb); not supported")
+    exefs_off, exefs_sz = (v * MU for v in struct.unpack("<II", hdr[0x1A0:0x1A8]))
+    romfs_off, romfs_sz = (v * MU for v in struct.unpack("<II", hdr[0x1B0:0x1B8]))
     key_y = int.from_bytes(hdr[:16], "big")
     pid = bytes(hdr[0x108:0x110])
     sec = {0x00: 0x2C, 0x01: 0x25, 0x0A: 0x18, 0x0B: 0x1B}[hdr[0x18B]]
@@ -91,7 +91,6 @@ def decrypt_ncch(src, dst, s_base, d_base, size, keys):
         copy_region(src, dst, s_base + 0x200 + 0x800, d_base + 0x200 + 0x800, 0x400,
                     ctr_cipher(k_base, pid, 1, 0x800))
 
-    exefs_off, exefs_sz = (v * MU for v in struct.unpack("<II", hdr[0x1A0:0x1A8]))
     if exefs_sz:
         src.seek(s_base + exefs_off)
         exefs_hdr = ctr_cipher(k_base, pid, 2, 0).decrypt(src.read(0x200))
@@ -107,11 +106,31 @@ def decrypt_ncch(src, dst, s_base, d_base, size, keys):
             copy_region(src, dst, s_base + exefs_off + rel, d_base + exefs_off + rel,
                         (fsz + MU - 1) // MU * MU, ctr_cipher(key, pid, 2, rel))
 
-    romfs_off, romfs_sz = (v * MU for v in struct.unpack("<II", hdr[0x1B0:0x1B8]))
     if romfs_sz:
         copy_region(src, dst, s_base + romfs_off, d_base + romfs_off, romfs_sz,
                     ctr_cipher(k_sec, pid, 3, 0))
 
+
+def decrypt_ncch(src, dst, s_base, d_base, size, keys, needed=True):
+    src.seek(s_base)
+    hdr = bytearray(src.read(0x200))
+    assert hdr[0x100:0x104] == b"NCCH", "no NCCH"
+    copy_region(src, dst, s_base, d_base, size)
+    if hdr[0x18F] & 0x04:
+        return
+    exefs_off, exefs_sz = (v * MU for v in struct.unpack("<II", hdr[0x1A0:0x1A8]))
+    romfs_off, romfs_sz = (v * MU for v in struct.unpack("<II", hdr[0x1B0:0x1B8]))
+    src.seek(s_base + (exefs_off if exefs_sz else romfs_off))
+    start = src.read(8)
+    # older tools decrypted the contents and left the flag set, some only
+    # the game's and not the manual's or the update's, which it can do
+    # without
+    if not ((exefs_sz and start.rstrip(b"\0") in PLAIN) or (not exefs_sz and start[:4] == b"IVFC")):
+        if keys is None and not needed:
+            return
+        if keys is None:
+            sys.exit("the game is encrypted: put your console's aes_keys.txt next to it or in the kit's folder, or give it with --keys")
+        decrypt_contents(src, dst, s_base, d_base, hdr, keys)
     hdr[0x18B] = 0
     hdr[0x18F] = (hdr[0x18F] & ~0x03) | 0x04
     dst.seek(d_base)
@@ -122,10 +141,27 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     src_path, dst_path = sys.argv[1], sys.argv[2]
-    keys = load_keys(sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser("~/Downloads/aes_keys.txt"))
+    keys = load_keys(sys.argv[3]) if len(sys.argv) > 3 else None
     if os.path.abspath(src_path) == os.path.abspath(dst_path):
         sys.exit("refusing to overwrite input")
     with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+        src.seek(0x100)
+        if src.read(4) == b"NCSD":
+            # a cartridge image keeps its layout, each partition decrypted
+            # where it is
+            src.seek(0x120)
+            table = [struct.unpack("<II", src.read(8)) for _ in range(8)]
+            first = min(off for off, size in table if size) * MU
+            copy_region(src, dst, 0, 0, first)
+            end = 0
+            for i, (off, size) in enumerate(table):
+                if size:
+                    decrypt_ncch(src, dst, off * MU, off * MU, size * MU, keys, i == 0)
+                    end = max(end, (off + size) * MU)
+            dst.truncate(end)
+            print(f"wrote {dst_path}: {sum(1 for _, size in table if size)} partition(s), {end} bytes")
+            return
+        src.seek(0)
         contents = cia_contents(src)
         table, pos = [], 0x4000
         for idx, off, size in contents:

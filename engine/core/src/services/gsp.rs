@@ -1,6 +1,6 @@
 //! gsp::Gpu, the GPU service.
 
-use zakuro_common::memory_map::{FCRAM_PADDR, PAGE_SIZE};
+use zakuro_common::memory_map::{FCRAM_PADDR, FCRAM_SIZE_NEW3DS, PAGE_SIZE};
 use zakuro_cpu::Bus;
 
 use crate::kernel::ipc::{CommandBuffer, Descriptor, Header};
@@ -542,7 +542,7 @@ fn execute_command(system: &mut System, command: GxCommand) {
 /// converts a physical address in a GX command to the linear-heap virtual
 /// address it corresponds to, which is where our memory actually is.
 pub fn physical_to_virtual(system: &System, paddr: u32) -> u32 {
-    if paddr >= FCRAM_PADDR {
+    if (FCRAM_PADDR..FCRAM_PADDR + FCRAM_SIZE_NEW3DS).contains(&paddr) {
         system.kernel.linear_base + (paddr - FCRAM_PADDR)
     } else if (0x1800_0000..0x1860_0000).contains(&paddr) {
         zakuro_common::memory_map::VRAM_VADDR + (paddr - 0x1800_0000)
@@ -561,6 +561,16 @@ mod tests {
     use super::*;
     use crate::memory::{MemoryState, Permission};
     use crate::{Config, System};
+
+    /// a New 3DS keeps the linear heap at 0x30000000, past physical FCRAM,
+    /// so a GX command naming it there is left as it is, not moved again.
+    #[test]
+    fn a_new_3ds_linear_heap_address_is_already_virtual() {
+        let mut system = System::new(Config { new3ds: true, ..Config::default() });
+        system.kernel.linear_base = zakuro_common::memory_map::linear_heap_base(true);
+        assert_eq!(physical_to_virtual(&system, 0x2000_1000), 0x3000_1000);
+        assert_eq!(physical_to_virtual(&system, 0x315B_8810), 0x315B_8810);
+    }
 
     /// maps the GSP shared memory block and points shared_memory_address
     /// at it, the way svcMapMemoryBlock does for a real title, so a test

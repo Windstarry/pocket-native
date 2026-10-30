@@ -213,7 +213,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         let mut resumed: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for (&entry, function) in &functions {
             if source.is_empty() {
-                source.push_str("#include \"recomp.h\"\n");
+                source.push_str("#include \"recomp.h\"\n#ifdef RECOMP_FASTMEM\n#undef RECOMP_VIEW\n#define RECOMP_VIEW(ctx) view\n#endif\n");
             }
             if included.insert(index) {
                 source.push_str(&include);
@@ -306,7 +306,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
 fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
     let mut body = String::new();
     write_body(&mut body, program, scope, entry, function);
-    let head = format!("void {}(Context *ctx) {{\n", name(scope.prefix, entry, function.mode == Mode::Thumb));
+    let head = format!("void {}(Context *ctx) {{\n    uint8_t *const view = ctx->fastmem;\n", name(scope.prefix, entry, function.mode == Mode::Thumb));
     match flags_in_locals(&body) {
         Some(body) => {
             out.push_str("#undef RECOMP_SYNC_OUT\n#undef RECOMP_SYNC_IN\n");

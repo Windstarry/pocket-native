@@ -65,7 +65,6 @@ fn apply_options(system: &mut System, game: &GameSettings, profile: &Profile, ba
     system.set_bottom_full_rate(full_rate);
     let advanced = Advanced::of(game, profile);
     system.set_skip_bottom(advanced.skip_bottom);
-    system.set_bottom_relearn(profile.bottom_relearn);
     system.set_skip_right_eye(advanced.skip_right_eye);
 }
 
@@ -145,6 +144,7 @@ pub fn run(mut args: Vec<String>) {
         data_dir: Some(data.clone()),
         language: game.language,
         region: game.region,
+        new3ds: advanced.new3ds,
         // ZAKURO_RESOLUTION=2.5 over the menu's, for trying one
         resolution: std::env::var("ZAKURO_RESOLUTION").ok().and_then(|v| v.parse().ok()).unwrap_or(settings.resolution),
         // ZAKURO_CLOCK=milliseconds since 1900 starts the clock there, as boot
@@ -194,6 +194,8 @@ pub fn run(mut args: Vec<String>) {
     // whether the menu went up, and with which of the touch controls' overlays
     let (mut menu_drawn, mut menu_controls) = (false, None);
     let (mut fps, mut last_fps, mut status, mut fps_since) = (0u32, 0u32, None, Instant::now());
+    // since when shaders have been building, said on screen after a second
+    let mut building_since: Option<Instant> = None;
     // what the screen says for a moment after a hotkey, and since when
     let mut note: Option<(&str, Instant)> = None;
     let mut fn_alone = false;
@@ -552,7 +554,10 @@ pub fn run(mut args: Vec<String>) {
             }
             let said = note.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)).map(|(said, _)| said);
             if second || said != status.as_ref().and_then(|status: &Status| status.note) {
-                let now = Status::now(&settings, last_fps, said);
+                let building = zakuro_gpu::compiling();
+                building_since = if building > 0 { building_since.or(Some(Instant::now())) } else { None };
+                let building = building_since.filter(|since| since.elapsed() >= Duration::from_secs(1)).map(|_| building);
+                let now = Status::now(&settings, last_fps, said, building);
                 if now != status {
                     overlay = now.as_ref().map(|now| {
                         let mut canvas = Canvas::new(&font, PANEL);

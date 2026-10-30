@@ -1,10 +1,11 @@
 # build.ps1 [rom...] [-Keys aes_keys.txt] [-Out folder]
 #
 # build.sh for Windows: builds Pocket Native and games for the handheld from
-# your own ROMs, decrypted .3ds/.cci files or .cia files with your console's
-# aes_keys.txt, inside a container (Docker Desktop or Podman). With no ROM
-# it asks for them. Leaves "Pocket Native" in the output folder, build\ by
-# default, to copy into roms\ports on the card.
+# your own ROMs, .3ds/.cci or .cia files, compressed (.zcci/.zcia) or not,
+# with your console's aes_keys.txt where they are encrypted, inside a
+# container (Docker Desktop or Podman). With no ROM it asks for them. Leaves
+# "Pocket Native" in the output folder, build\ by default, to copy into
+# roms\ports on the card.
 param(
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)][string[]]$Rom = @(),
     [string]$Keys = "",
@@ -28,7 +29,7 @@ function Pick($title, $filter, $many) {
 }
 
 if ($Rom.Count -eq 0) {
-    $Rom = @(Pick "Pick the games to build" "3DS games (*.3ds;*.cci;*.cia)|*.3ds;*.cci;*.cia|All files|*.*" $true)
+    $Rom = @(Pick "Pick the games to build" "3DS games (*.3ds;*.cci;*.cia;*.zcci;*.zcia)|*.3ds;*.cci;*.cia;*.zcci;*.zcia|All files|*.*" $true)
     if ($Rom.Count -eq 0) {
         Write-Host "no game picked"
         exit 2
@@ -47,13 +48,14 @@ if (-not $Out) { $Out = Join-Path $repo "build" }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 $Out = (Resolve-Path -LiteralPath $Out).Path
 
-# a .cia takes the keys given, else the aes_keys.txt beside it or in the kit,
-# else the one picked when asked
+# a game takes the keys given, else the aes_keys.txt beside it or in the
+# kit, for an encrypted one, and a .cia else the one picked when asked
 function KeysFor($file) {
-    if ($script:Keys -or [IO.Path]::GetExtension($file) -ne ".cia") { return $script:Keys }
+    if ($script:Keys) { return $script:Keys }
     foreach ($near in @((Join-Path (Split-Path -Parent $file) "aes_keys.txt"), (Join-Path $repo "aes_keys.txt"))) {
         if (Test-Path -LiteralPath $near -PathType Leaf) { return $near }
     }
+    if (@(".cia", ".zcia") -notcontains [IO.Path]::GetExtension($file).ToLower()) { return $null }
     $picked = @(Pick "A .cia needs your console's aes_keys.txt, pick it" "aes_keys.txt|aes_keys.txt|Text files (*.txt)|*.txt" $false)
     if ($picked.Count -gt 0) { $script:Keys = $picked[0] }
     return $script:Keys

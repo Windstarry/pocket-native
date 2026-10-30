@@ -819,10 +819,6 @@ impl System {
         self.gpu_work(&[], move |gpu, _, _| gpu.skip_bottom = skip);
     }
 
-    pub fn set_bottom_relearn(&mut self, relearn: bool) {
-        self.gpu_work(&[], move |gpu, _, _| gpu.bottom_relearn = relearn);
-    }
-
     pub fn set_skip_right_eye(&mut self, skip: bool) {
         self.gpu_work(&[], move |gpu, _, _| gpu.skip_right_eye = skip);
     }
@@ -1156,7 +1152,10 @@ impl GpuMemory for GuestMemory<'_> {
     }
 
     fn translate(&self, paddr: u32) -> u32 {
-        if paddr >= FCRAM_PADDR {
+        // GX commands name the linear heap by its virtual address, which a
+        // New 3DS has past physical FCRAM, the rest of the GPU's addresses
+        // are physical
+        if (FCRAM_PADDR..FCRAM_PADDR + FCRAM_SIZE_NEW3DS).contains(&paddr) {
             self.linear_base + (paddr - FCRAM_PADDR)
         } else if (VRAM_PADDR..VRAM_PADDR + VRAM_SIZE).contains(&paddr) {
             VRAM_VADDR + (paddr - VRAM_PADDR)

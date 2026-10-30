@@ -18,5 +18,5 @@ with open(sys.argv[1], "rb") as rom:
         sys.exit("the image's first partition is not an NCCH")
     # flags[7] bit 2, no crypto
     if not ncch[0x18F] & 0x4:
-        sys.exit("the image is encrypted: decrypt it first (GodMode9: Decrypt file), or build from the .cia with --keys")
+        sys.exit("the image is encrypted: decrypt it first (GodMode9: Decrypt file), or build it with your aes_keys.txt")
 print(f"{title_id:016X}")

@@ -63,7 +63,7 @@ const ON_OFF: [&str; 2] = ["Off", "On"];
 /// the advanced settings that turn on and off, see settings::Advanced: the
 /// name, the setting, what off and on show as, and the help under the list.
 #[allow(clippy::type_complexity)]
-const TOGGLES: [(&str, fn(&mut Advanced) -> &mut bool, [&str; 2], &str); 31] = [
+const TOGGLES: [(&str, fn(&mut Advanced) -> &mut bool, [&str; 2], &str); 33] = [
     ("Bottom screen skipping", |a| &mut a.skip_bottom, ON_OFF, "Draws the bottom screen less often while it stands still. Try Off if it flickers, lags or goes black."),
     ("Speed hacks", |a| &mut a.fast, ON_OFF, "Turns the ten speed hacks below on or off together. Off is the first thing to try when a game looks wrong."),
     ("Quick surface checks", |a| &mut a.quick_checks, ON_OFF, "Checks pictures against memory at a few spots only. Try Off if old pictures or garbage stay after a scene change."),
@@ -95,6 +95,8 @@ const TOGGLES: [(&str, fn(&mut Advanced) -> &mut bool, [&str; 2], &str); 31] = [
     ("Shader compiling", |a| &mut a.background_shaders, ["When needed", "Background"], "Background builds new shaders with no pause, a stand-in drawn meanwhile. Try When needed for brief glitches."),
     ("Skip the right eye", |a| &mut a.skip_right_eye, ON_OFF, "Leaves out the right eye's picture, which 2D never shows. Try Off if the top screen flickers or is wrong."),
     ("Draw only shown frames", |a| &mut a.shown_only, ON_OFF, "Leaves out the frames the frame cap never shows, easing the GPU. Try Off if it stutters."),
+    ("Compressed alpha textures", |a| &mut a.etc1a4, ON_OFF, "Keeps see-through compressed textures compressed too. Try Off if a game runs slower than on 0.4.0."),
+    ("New 3DS mode", |a| &mut a.new3ds, ON_OFF, "Runs a game that has a New 3DS mode in it, with its extra memory and effects. Slower on most handhelds."),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -179,10 +181,10 @@ fn sections(page: Page, profile: &Profile) -> Vec<(&'static str, Vec<Field>)> {
         Page::Advanced => vec![
             ("Applies at once", vec![Field::Toggle(0), Field::Toggle(29), Field::Toggle(30), Field::FrameSkip]),
             ("Speed hacks - requires restart", toggles(1..=11)),
-            ("Graphics - requires restart", [toggles(12..=22), vec![Field::Toggle(28)]].concat()),
+            ("Graphics - requires restart", [toggles(12..=18), vec![Field::Toggle(31)], toggles(19..=22), vec![Field::Toggle(28)]].concat()),
             ("CPU - requires restart", toggles(23..=24)),
             ("Loading - requires restart", toggles(25..=27)),
-            ("System - requires restart", vec![Field::Language, Field::Region]),
+            ("System - requires restart", vec![Field::Language, Field::Region, Field::Toggle(32)]),
             ("", vec![Field::Restart, Field::Compatible, Field::Defaults, Field::Back]),
         ],
     }
@@ -584,11 +586,13 @@ pub struct Status {
     clock: Option<String>,
     /// what a hotkey just did, at the top.
     pub note: Option<&'static str>,
+    /// how many shaders are still building, at the top left.
+    building: Option<usize>,
 }
 
 impl Status {
     /// none when the settings show nothing.
-    pub fn now(settings: &Settings, fps: u32, note: Option<&'static str>) -> Option<Status> {
+    pub fn now(settings: &Settings, fps: u32, note: Option<&'static str>, building: Option<usize>) -> Option<Status> {
         let read = |path: &str| std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse::<i64>().ok());
         let status = Status {
             fps: settings.show_fps.then(|| match read("/sys/class/thermal/thermal_zone0/temp") {
@@ -598,8 +602,9 @@ impl Status {
             battery: settings.show_clock.then(battery).flatten(),
             clock: settings.show_clock.then(clock),
             note,
+            building,
         };
-        (status.fps.is_some() || status.clock.is_some() || note.is_some()).then_some(status)
+        (status.fps.is_some() || status.clock.is_some() || note.is_some() || building.is_some()).then_some(status)
     }
 
     pub fn draw(&self, canvas: &mut Canvas, (width, height): (u32, u32)) {
@@ -610,6 +615,11 @@ impl Status {
             let half = canvas.measure(BIG, note) / 2.0 + 6.0;
             canvas.fill([width / 2.0 - half, 8.0, width / 2.0 + half, 32.0], backing);
             canvas.text(BIG, note, width / 2.0 - half + 6.0, 11.0, rgba(TEXT, 255), false);
+        }
+        if let Some(building) = self.building {
+            let line = format!("Building shaders ({building})");
+            canvas.fill([8.0, 8.0, 20.0 + canvas.measure(BIG, &line), 32.0], backing);
+            canvas.text(BIG, &line, 14.0, 11.0, rgba(TEXT, 255), false);
         }
         if let Some(line) = &self.fps {
             canvas.fill([width - 20.0 - canvas.measure(BIG, line), top, width - 8.0, bottom], backing);

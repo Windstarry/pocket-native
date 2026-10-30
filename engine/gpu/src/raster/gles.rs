@@ -362,6 +362,10 @@ const EQUATIONS: [u32; 5] = [glow::FUNC_ADD, glow::FUNC_SUBTRACT, glow::FUNC_REV
 
 const TEXTURE_KEEP_FLUSHES: u64 = 600;
 
+/// batches a program nothing drew with is kept for once the driver ran out
+/// of room.
+const PROGRAM_KEEP_FLUSHES: u64 = 600;
+
 /// batches a surface nothing drew into or read stays for, and how often the
 /// ones past it are let go.
 const SURFACE_KEEP_FLUSHES: u64 = 600;
@@ -407,6 +411,10 @@ struct Surface {
     /// the journal's stamp when memory was last found to hold the shadow,
     /// and the batch that was in.
     matched: (u64, u64),
+    /// bytes at the end of its memory a transfer into it never writes, which
+    /// another surface has: a texture padded to a wider row whose last
+    /// row's padding runs into the picture copied into it.
+    tail_gap: u32,
 }
 
 static VERSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -428,7 +436,7 @@ impl Surface {
     }
 
     fn overlaps(&self, addr: u32, len: u32) -> bool {
-        addr < self.addr + self.size() && self.addr < addr + len
+        addr < self.addr + self.size() - self.tail_gap && self.addr < addr + len
     }
 
     fn row_bytes(&self) -> u32 {
@@ -437,7 +445,7 @@ impl Surface {
 
     fn dirty_overlaps(&self, addr: u32, len: u32) -> bool {
         self.dirty.is_some_and(|(start, end)| {
-            let (from, to) = (self.addr + start * self.row_bytes(), self.addr + end * self.row_bytes());
+            let (from, to) = (self.addr + start * self.row_bytes(), (self.addr + end * self.row_bytes()).min(self.addr + self.size() - self.tail_gap));
             addr < to && from < addr + len
         })
     }
@@ -1237,6 +1245,14 @@ static SECOND_SHOWS_TOP: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// whether the second window's screen is stretched over all of it.
 static SECOND_STRETCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// programs the compiler thread has yet to build.
+static BUILDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// how many programs are still being built, for the screen to say so.
+pub fn compiling() -> usize {
+    BUILDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// whether the second window's screen fills all of it, out of shape, rather
 /// than keeping its shape with bars.
 pub fn set_second_stretched(stretched: bool) {
@@ -1800,7 +1816,10 @@ fn link(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Progra
             gl.shader_source(shader, source);
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
-                return Err(format!("could not compile a shader, {}", gl.get_shader_info_log(shader)));
+                let error = format!("could not compile a shader, {}", gl.get_shader_info_log(shader));
+                shaders.into_iter().chain([shader]).for_each(|shader| gl.delete_shader(shader));
+                gl.delete_program(program);
+                return Err(error);
             }
             gl.attach_shader(program, shader);
             shaders.push(shader);
@@ -1811,7 +1830,9 @@ fn link(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Progra
             gl.delete_shader(shader);
         }
         if !gl.get_program_link_status(program) {
-            return Err(format!("could not link a program, {}", gl.get_program_info_log(program)));
+            let error = format!("could not link a program, {}", gl.get_program_info_log(program));
+            gl.delete_program(program);
+            return Err(error);
         }
         Ok(program)
     }
@@ -2711,6 +2732,7 @@ struct Cached {
     depth_mask: Option<bool>,
     stencil: Option<Option<(u32, u32, u32)>>,
     units: [Option<(glow::Texture, Option<glow::Sampler>)>; 6],
+    active_unit: Option<usize>,
     tables_bound: Option<usize>,
     viewport: Option<[i32; 4]>,
     cull: Option<u32>,
@@ -2862,8 +2884,20 @@ struct Resident {
     draws: u64,
 }
 
-/// how many bytes of arrays stay on the GPU before the oldest go.
+/// how many bytes of arrays stay on the GPU before the oldest go, each
+/// counted in whole pages.
 const RESIDENT_BYTES: usize = 64 << 20;
+
+/// how many arrays stay on the GPU before the oldest go, whatever their
+/// size: each is a buffer the driver keeps pages and bookkeeping for, and
+/// Ocarina of Time 3D makes some 85 small ones a second, which ran a 1 GB
+/// handheld out of memory with this cache at a tenth of its bytes.
+const RESIDENT_ARRAYS: usize = 2048;
+
+/// what an array costs the driver at least, whole 4 KiB pages.
+fn resident_cost(len: usize) -> usize {
+    len.next_multiple_of(4096)
+}
 
 impl Resident {
     fn buffer(&mut self, gl: &glow::Context, array: &Arc<[u8]>) -> Result<glow::Buffer, String> {
@@ -2873,26 +2907,16 @@ impl Resident {
             *used = draws;
             return Ok(*buffer);
         }
-        if self.bytes + array.len() > RESIDENT_BYTES {
-            // the arrays no draw used lately go, all of them when that is not
-            // enough
-            let recent = draws.saturating_sub(20_000);
-            let mut gone = Vec::new();
-            self.buffers.retain(|_, (buffer, array, used)| {
-                let keep = *used >= recent;
-                if !keep {
-                    gone.push((*buffer, array.len()));
-                }
-                keep
-            });
-            if self.bytes + array.len() > RESIDENT_BYTES + gone.iter().map(|(_, len)| len).sum::<usize>() {
-                gone.extend(self.buffers.drain().map(|(_, (buffer, array, _))| (buffer, array.len())));
-            }
-            for (buffer, len) in gone {
-                self.bytes -= len;
-                // SAFETY: on the GL thread, the draws that read it were issued
-                unsafe { gl.delete_buffer(buffer) };
-            }
+        let cost = resident_cost(array.len());
+        // the array no draw used for longest goes, one for each new one once
+        // full rather than many in one draw, and never one the draw being
+        // made already took
+        while self.bytes + cost > RESIDENT_BYTES || self.buffers.len() >= RESIDENT_ARRAYS {
+            let Some(oldest) = self.buffers.iter().filter(|(_, (_, _, used))| *used != draws).min_by_key(|(_, (_, _, used))| *used).map(|(&key, _)| key) else { break };
+            let (buffer, array, _) = self.buffers.remove(&oldest).expect("an array just found");
+            self.bytes -= resident_cost(array.len());
+            // SAFETY: on the GL thread, the draws that read it were issued
+            unsafe { gl.delete_buffer(buffer) };
         }
         // SAFETY: on the GL thread with the context current
         let buffer = unsafe {
@@ -2901,7 +2925,7 @@ impl Resident {
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, array, glow::STATIC_DRAW);
             buffer
         };
-        self.bytes += array.len();
+        self.bytes += cost;
         self.buffers.insert(key, (buffer, array.clone(), draws));
         Ok(buffer)
     }
@@ -3107,13 +3131,21 @@ impl DrawJob {
                     }
                     cache.stencil = Some(stencil);
                 }
+                // the texture and the sampler each only when it changed, the
+                // alpha units mostly share their colour unit's sampler
                 for (unit, (texture, sampler)) in self.bound.into_iter().enumerate() {
-                    if cache.units[unit] != Some((texture, sampler)) {
-                        gl.active_texture(glow::TEXTURE0 + unit as u32);
+                    let was = cache.units[unit];
+                    if was.map(|(texture, _)| texture) != Some(texture) {
+                        if cache.active_unit != Some(unit) {
+                            gl.active_texture(glow::TEXTURE0 + unit as u32);
+                            cache.active_unit = Some(unit);
+                        }
                         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                        gl.bind_sampler(unit as u32, sampler);
-                        cache.units[unit] = Some((texture, sampler));
                     }
+                    if was.map(|(_, sampler)| sampler) != Some(sampler) {
+                        gl.bind_sampler(unit as u32, sampler);
+                    }
+                    cache.units[unit] = Some((texture, sampler));
                 }
                 if cache.uniforms != self.uniforms {
                     let offset = local.uniforms.push(&gl, glow::UNIFORM_BUFFER, word_bytes(&self.uniforms))?;
@@ -3556,7 +3588,10 @@ fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Optio
                 gl.shader_source(shader, source);
                 gl.compile_shader(shader);
                 if !gl.get_shader_compile_status(shader) {
-                    return Err(format!("could not compile a shader, {}", gl.get_shader_info_log(shader)));
+                    let error = format!("could not compile a shader, {}", gl.get_shader_info_log(shader));
+                    shaders.into_iter().chain([shader]).for_each(|shader| gl.delete_shader(shader));
+                    gl.delete_program(program);
+                    return Err(error);
                 }
                 gl.attach_shader(program, shader);
                 shaders.push(shader);
@@ -3568,7 +3603,9 @@ fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Optio
                 gl.delete_shader(shader);
             }
             if !gl.get_program_link_status(program) {
-                return Err(format!("could not link a program, {}", gl.get_program_info_log(program)));
+                let error = format!("could not link a program, {}", gl.get_program_info_log(program));
+                gl.delete_program(program);
+                return Err(error);
             }
             if let (Some(path), Some(binary)) = (cached, gl.get_program_binary(program)) {
                 let mut bytes = binary.format.to_le_bytes().to_vec();
@@ -3629,6 +3666,7 @@ impl Compiler {
                     let result = build_program(&gl, &job.vertex, &job.fragment, job.cached.as_deref());
                     // SAFETY: the context is current on this thread
                     unsafe { gl.finish() };
+                    BUILDING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     if finished.send((job.key, result)).is_err() {
                         break;
                     }
@@ -3865,6 +3903,13 @@ pub struct Gles {
     flushes: u64,
     /// the batch surfaces left unused are next looked for.
     retire_at: u64,
+    /// the batch each program last drew in, and the last one stamped.
+    program_used: rustc_hash::FxHashMap<glow::Program, u64>,
+    stamped: Option<(glow::Program, u64)>,
+    /// the batch room was last made in, and the programs that got a second
+    /// try after it.
+    room_made: Option<u64>,
+    retried: rustc_hash::FxHashSet<ProgramKey>,
     /// display transfers so far, the clock occlusion culling keeps time by.
     pictures: u64,
     warned_logic_op: bool,
@@ -3908,6 +3953,10 @@ impl Gles {
             let shades = !crate::switch("ZAKURO_CPU_SHADERS", "vertices shaded on the CPU") && gl.get_parameter_i32(glow::MAX_VERTEX_ATTRIBS) >= 16;
             let storage_align = gl.get_parameter_i32(glow::SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT).max(16) as usize;
             let tables = Ring::new(&gl, glow::SHADER_STORAGE_BUFFER, 8 << 20, storage_align)?;
+            // the generic programs check the fog at run time and so read the
+            // tables whatever the draw, which Panfrost faults on with nothing
+            // bound there: the ring's start stands in until a draw's go up
+            gl.bind_buffer_range(glow::SHADER_STORAGE_BUFFER, 4, Some(tables.buffer), 0, TABLES_SIZE as i32);
             let blank = gl.create_texture()?;
             gl.bind_texture(glow::TEXTURE_2D, Some(blank));
             gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, 1, 1);
@@ -3920,6 +3969,8 @@ impl Gles {
             ADRENO.store(name.contains("Adreno"), std::sync::atomic::Ordering::Relaxed);
             if gl.supported_extensions().contains("GL_OES_compressed_ETC1_RGB8_texture") && !crate::switch("ZAKURO_NO_ETC1", "ETC1 textures decoded") {
                 crate::raster::SAMPLES_ETC1.store(true, std::sync::atomic::Ordering::Relaxed);
+                let split = !crate::switch("ZAKURO_NO_ETC1A4", "ETC1A4 textures decoded");
+                crate::raster::SAMPLES_ETC1A4.store(split, std::sync::atomic::Ordering::Relaxed);
                 log::info!("ETC1 textures stay compressed");
             }
             LOCAL.with(|local| {
@@ -3967,15 +4018,48 @@ impl Gles {
                 over_drawing: Default::default(),
                 flushes: 0,
                 retire_at: RETIRE_EVERY,
+                program_used: Default::default(),
+                stamped: None,
+                room_made: None,
+                retried: Default::default(),
                 pictures: 0,
                 warned_logic_op: false,
                 preloading: false,
                 quarters: 4,
                 natives: Default::default(),
             };
+            gles.prepare_helpers();
             gles.preload();
             gles.prepare_stand_ins();
             Ok(gles)
+        }
+    }
+
+    /// builds the programs copies, transfers and read backs use before the
+    /// compiler thread has work, rather than the first one a game needs
+    /// waiting on the GL thread for the compiler's lock while it builds the
+    /// game's own, which stopped everything for half a minute on a first run.
+    fn prepare_helpers(&mut self) {
+        let mut build = || -> Result<(), String> {
+            self.transfer = Some(self.compute(TRANSFER_SOURCE)?);
+            self.reinterpreter = Some(self.compute(REINTERPRET_SOURCE)?);
+            self.upright = Some(self.compute(UPRIGHT_SOURCE)?);
+            let depth = self.graphics(PACK_VERTEX_SOURCE, PACK_DEPTH_SOURCE)?;
+            let stencil = self.graphics(PACK_VERTEX_SOURCE, PACK_STENCIL_SOURCE)?;
+            let copiers = [
+                self.graphics(PACK_VERTEX_SOURCE, COPY_COLOR_SOURCE)?,
+                self.graphics(PACK_VERTEX_SOURCE, COPY_DEPTH_SOURCE)?,
+                self.graphics(PACK_VERTEX_SOURCE, COPY_STENCIL_SOURCE)?,
+            ];
+            // SAFETY: on the GL thread
+            let (packing, copying) = unsafe { (self.gl.create_vertex_array()?, self.gl.create_vertex_array()?) };
+            self.packers = Some((depth, stencil, packing));
+            self.copiers = Some((copiers, copying));
+            Ok(())
+        };
+        // the ones not built are built when first needed, as before
+        if let Err(error) = build() {
+            log::warn!("the copy and transfer programs wait until needed, {error}");
         }
     }
 
@@ -4211,15 +4295,17 @@ impl Gles {
     /// tiles no drawing holds, which come from memory at the console's size.
     /// the copy takes the drawings' tiles over a run at a time on the GPU
     /// rather than reading them back. RGBA8 alone, which a blit leaves as it
-    /// is.
-    fn retiled_sources(&self, texture: &DrawnTexture) -> Option<Vec<(Option<usize>, i64, i64, i64)>> {
+    /// is. drawings of other kinds inside the rows from memory, as Smash's
+    /// small buffers below the picture it reads as 512x512, are written
+    /// back first, those alone.
+    fn retiled_sources(&self, texture: &DrawnTexture) -> Option<(Vec<(Option<usize>, i64, i64, i64)>, Vec<usize>)> {
         let kind = Kind::Color(ColorFormat::Rgba8);
         if texture.format != ColorFormat::Rgba8 || texture.width % 8 != 0 || texture.height % 8 != 0 {
             return None;
         }
         let (tile, len) = ((64 * kind.bytes()) as i64, texture.width * texture.height * kind.bytes());
         let (across, tiles) = ((texture.width / 8) as i64, (texture.width / 8 * texture.height / 8) as i64);
-        let mut pieces = Vec::new();
+        let (mut pieces, mut apart) = (Vec::new(), Vec::new());
         for (index, s) in self.surfaces.iter().enumerate().filter(|(_, s)| s.dirty_overlaps(texture.addr, len)) {
             // its dirty rows are what it drew, though others took rows of it
             let (first, last) = s.dirty?;
@@ -4238,7 +4324,8 @@ impl Gles {
                 && to % run == 0
                 && (from - offset / tile) % run == 0;
             if !fits {
-                return None;
+                apart.push(index);
+                continue;
             }
             pieces.push((Some(index), offset / tile, from, to));
         }
@@ -4264,7 +4351,12 @@ impl Gles {
                 whole.push(piece);
             }
         }
-        Some(whole)
+        let start = texture.addr as i64;
+        let inside_memory = |s: &Surface| {
+            let (from, to) = ((s.addr as i64 - start).max(0) / tile, ((s.addr as i64 + s.size() as i64 - start).min(len as i64) + tile - 1) / tile);
+            whole.iter().any(|piece| piece.0.is_none() && piece.2 <= from && to <= piece.3)
+        };
+        apart.iter().all(|&index| inside_memory(&self.surfaces[index])).then_some((whole, apart))
     }
 
     /// the surface a drawn texture is the whole of, as it is, which a draw
@@ -4408,7 +4500,8 @@ impl Gles {
 
     fn copy_texture<M: GpuMemory>(&mut self, memory: &mut M, texture: &DrawnTexture) -> Result<glow::Texture, String> {
         if !self.texture_source(texture).is_some_and(|(index, _)| self.surfaces[index].dirty.is_some()) {
-            if let Some(pieces) = self.retiled_sources(texture) {
+            if let Some((pieces, apart)) = self.retiled_sources(texture) {
+                self.write_back(memory, apart)?;
                 return self.copy_retiled(memory, texture, pieces);
             }
         }
@@ -4691,7 +4784,7 @@ impl Gles {
             let bpp = s.kind.bytes();
             let (tile, tile_row) = (64 * bpp, 8 * s.row_bytes());
             let offset = input.checked_sub(s.addr)?;
-            if offset + size > s.size() || !offset.is_multiple_of(tile) {
+            if offset >= s.size() || !offset.is_multiple_of(tile) {
                 return None;
             }
             // a line of the input is whole rows of tiles, or the same few
@@ -4701,6 +4794,11 @@ impl Gles {
                 (bytes, skip) if bytes + skip == tile_row => bytes,
                 _ => return None,
             };
+            // whole rows of tiles can run on past the drawing into memory,
+            // as Federation Force copies 64 rows out of 56
+            if offset + size > s.size() && line != tile_row {
+                return None;
+            }
             let start = offset % tile_row;
             if !line.is_multiple_of(tile) || !size.is_multiple_of(line) || start + line > tile_row || (line == tile_row && start != 0) {
                 return None;
@@ -4769,20 +4867,24 @@ impl Gles {
         let input_kind = Kind::Color(t.input_format);
         let output_kind = Kind::Color(t.output_format);
         static CPU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if t.input_linear || t.copy.0 == 0 || t.copy.1 == 0 || *CPU.get_or_init(|| crate::switch("ZAKURO_CPU_TRANSFERS", "display transfers on the CPU")) {
+        if t.copy.0 == 0 || t.copy.1 == 0 || *CPU.get_or_init(|| crate::switch("ZAKURO_CPU_TRANSFERS", "display transfers on the CPU")) {
             return Ok(false);
         }
         let rows = t.copy.1 * t.scale.1;
         let first = if t.flip { t.input_height - rows } else { 0 };
-        let tile_rows = 8 * t.input_width * input_kind.bytes();
+        // a linear input is a picture an earlier transfer left linear, as
+        // Paper Mario's, read the same way, row by row rather than eight
+        let tiled = !t.input_linear;
+        let step = if tiled { 8 } else { 1 };
+        let tile_rows = step * t.input_width * input_kind.bytes();
         let row_in = |s: &Surface| {
-            let offset = t.input.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * 8;
+            let offset = t.input.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * step;
             (offset + first + rows <= s.height).then_some(offset)
         };
         let Some((addr, input_size, row)) = self
             .surfaces
             .iter()
-            .filter(|s| s.kind == input_kind && s.tiled && s.width == t.input_width)
+            .filter(|s| s.kind == input_kind && s.tiled == tiled && s.width == t.input_width)
             .filter_map(|s| Some((s, row_in(s)?)))
             .max_by_key(|(s, _)| (s.dirty.is_some(), s.height))
             .map(|(s, row)| (s.addr, (s.width, s.height), row))
@@ -4791,13 +4893,22 @@ impl Gles {
         };
         let input_end = addr as u64 + (input_size.0 * input_size.1 * input_kind.bytes()) as u64;
         let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
-        if (addr as u64) < output_end && (t.output as u64) < input_end {
+        // a tiled output wider than the copy has its last row of tiles' end
+        // left as it was, which may be the input's start: Yo-kai Watch 2
+        // copies its 240 wide top screen into a texture 256 wide just before it
+        let gap = if t.output_tiled && t.copy.0 < t.output_width && t.copy.1 == t.output_height { ((t.output_width - t.copy.0) * 8 * output_kind.bytes()) as u64 } else { 0 };
+        if (addr as u64) < output_end - gap && (t.output as u64) < input_end {
             return Ok(false);
         }
+        let tail = ((addr as u64) < output_end && (t.output as u64) < input_end).then_some(gap as u32);
         self.current()?;
         let (source, target) = loop {
-            let source = self.surface_rows(memory, addr, input_size, input_kind, true, None)?;
-            let target = self.surface_rows(memory, t.output, (t.output_width, t.output_height), output_kind, t.output_tiled, None)?;
+            let source = self.surface_rows(memory, addr, input_size, input_kind, tiled, None)?;
+            let rows = tail.map(|_| (0, t.output_height - 8));
+            let target = self.surface_rows(memory, t.output, (t.output_width, t.output_height), output_kind, t.output_tiled, rows)?;
+            if let Some(gap) = tail {
+                self.surfaces[target].tail_gap = gap;
+            }
             if self.surfaces[source].checked && self.surfaces[target].checked {
                 break (source, target);
             }
@@ -4967,14 +5078,19 @@ impl Gles {
             gl.shader_source(shader, source);
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
-                return Err(format!("could not compile a compute shader, {}", gl.get_shader_info_log(shader)));
+                let error = format!("could not compile a compute shader, {}", gl.get_shader_info_log(shader));
+                gl.delete_shader(shader);
+                gl.delete_program(program);
+                return Err(error);
             }
             gl.attach_shader(program, shader);
             gl.link_program(program);
             gl.detach_shader(program, shader);
             gl.delete_shader(shader);
             if !gl.get_program_link_status(program) {
-                return Err(format!("could not link a compute program, {}", gl.get_program_info_log(program)));
+                let error = format!("could not link a compute program, {}", gl.get_program_info_log(program));
+                gl.delete_program(program);
+                return Err(error);
             }
             Ok(program)
         }
@@ -5126,7 +5242,9 @@ impl Gles {
         if !wait && !self.preloading {
             if let Some(compiler) = self.compiler.as_mut() {
                 compiler.pending.insert(key.clone());
+                BUILDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if compiler.jobs.send(Compile { key, vertex: compiled, fragment, cached }).is_err() {
+                    BUILDING.store(0, std::sync::atomic::Ordering::Relaxed);
                     self.compiler = None;
                 }
                 return Ok(None);
@@ -5138,7 +5256,15 @@ impl Gles {
             return worker.run(|| self.program(constants, writes_depth, lighting, vertex, wait, None));
         }
         disturb();
-        let program = build_program(&self.gl, &compiled, &fragment, cached.as_deref())?;
+        let program = match build_program(&self.gl, &compiled, &fragment, cached.as_deref()) {
+            Ok(program) => program,
+            Err(error) if self.retried.insert(key.clone()) => {
+                log::warn!("{error}");
+                self.make_room();
+                build_program(&self.gl, &compiled, &fragment, cached.as_deref())?
+            }
+            Err(error) => return Err(error),
+        };
         self.programs.insert(key.clone(), program);
         self.note_program(&key);
         Ok(Some(program))
@@ -5167,6 +5293,12 @@ impl Gles {
                 }
                 Err(error) => {
                     log::warn!("{error}");
+                    // the driver out of memory, most likely: the next draw
+                    // that needs it tries again once room is made
+                    if self.retried.insert(key.clone()) {
+                        self.make_room();
+                        continue;
+                    }
                     self.inputs.remove(&key);
                     if key.3 != 0 {
                         for translation in self.translated.values_mut() {
@@ -5175,7 +5307,7 @@ impl Gles {
                             }
                         }
                     }
-                    compiler.failed.insert(key, error);
+                    self.compiler.as_mut().expect("the compiler is still there").failed.insert(key, error);
                 }
             }
         }
@@ -5359,6 +5491,7 @@ impl Gles {
                     stale: false,
                     used: self.flushes,
                     matched: (0, 0),
+                    tail_gap: 0,
                 });
                 self.surfaces.len() - 1
             }
@@ -5504,7 +5637,13 @@ impl Gles {
         o.dirty = left;
         o.checked = false;
         o.stale = true;
-        o.shadow = Vec::new();
+        // the rows that came over no longer match memory, the rest still say
+        // what it held, for a write back to see the CPU wrote there since,
+        // as Kid Icarus keeps its heap where a picture's last rows were drawn
+        let row = o.row_bytes() as usize;
+        if let Some(rows) = o.shadow.get_mut(gone_from as usize * row..gone_to as usize * row) {
+            rows.iter_mut().for_each(|byte| *byte = !*byte);
+        }
         o.picture = None;
         let s = &mut self.surfaces[index];
         s.dirty = Some(merged);
@@ -5870,6 +6009,63 @@ impl Gles {
         }
     }
 
+    /// lets go of what the driver holds that can be made again when it
+    /// could not build a program, on a handheld its memory running out: the
+    /// textures, the vertex arrays kept on the GPU and the programs nothing
+    /// drew with for a while, rather than every draw after it going to the
+    /// CPU. Once a batch at most.
+    fn make_room(&mut self) {
+        if self.room_made == Some(self.flushes) {
+            return;
+        }
+        self.room_made = Some(self.flushes);
+        // the batch being made keeps what its draws already took
+        let mut textures = Vec::new();
+        let flushes = self.flushes;
+        self.textures.retain(|_, texture| {
+            let keep = texture.used == flushes;
+            if !keep {
+                textures.extend([Some(texture.texture), texture.alpha].into_iter().flatten());
+            }
+            keep
+        });
+        let recent = self.flushes.saturating_sub(PROGRAM_KEEP_FLUSHES);
+        let mut programs = Vec::new();
+        let used = &self.program_used;
+        self.programs.retain(|_, program| {
+            let keep = used.get(program).is_some_and(|&at| at >= recent);
+            if !keep {
+                programs.push(*program);
+            }
+            keep
+        });
+        for program in &programs {
+            self.program_used.remove(program);
+        }
+        self.fragment = None;
+        self.stamped = None;
+        log::warn!("the driver could not build a program: letting go of {} textures, {} programs and the vertex arrays kept on the GPU", textures.len(), programs.len());
+        let gl = self.gl;
+        self.worker.post_keeping(move || {
+            disturb();
+            local(|local| {
+                for (_, (buffer, _, _)) in local.resident.buffers.drain() {
+                    // SAFETY: on the GL thread, after every draw that used it
+                    unsafe { gl.delete_buffer(buffer) };
+                }
+                local.resident.bytes = 0;
+                (local.cache.resident, local.cache.stride) = (None, None);
+            });
+            // SAFETY: on the GL thread, after every draw that used them, the
+            // finish letting the driver take their memory back
+            unsafe {
+                textures.into_iter().for_each(|texture| gl.delete_texture(texture));
+                programs.into_iter().for_each(|program| gl.delete_program(program));
+                gl.finish();
+            }
+        });
+    }
+
     pub(crate) fn sync<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) -> Result<(), String> {
         if !self.surfaces.iter().any(|s| s.dirty_overlaps(addr, len)) {
             self.surfaces.iter_mut().filter(|s| s.overlaps(addr, len)).for_each(|s| s.checked = false);
@@ -5937,6 +6133,10 @@ impl Gles {
                 }
             }
             sim_present(&gl);
+            // with the next picture already waiting this one goes up at
+            // once: held for even pacing, it would hold up the title, which
+            // then skips frames and stays behind, Pokémon X at 16 fps
+            let frames = if presenting.load(std::sync::atomic::Ordering::Acquire) >= 2 { 1 } else { frames };
             if let Err(error) = show(gl, parts, frames) {
                 log::error!("could not show the screens, {error}");
             }
@@ -6042,15 +6242,17 @@ impl Gles {
             let (first, last) = s.dirty.unwrap_or((0, height));
             // memory the CPU wrote since the GPU last looked is newer than the
             // drawing, as when a draw finds it changed, a title that freed the
-            // buffer may keep its heap there
+            // buffer may keep its heap there: the rows that would go out are
+            // the ones compared
             let (addr, size) = (s.addr, s.size() as usize);
+            let (from, to) = (first as usize * s.row_bytes() as usize, (last as usize * s.row_bytes() as usize).min(size - s.tail_gap as usize));
             let written = s.shadow.len() == size
-                && match memory.slice(addr, size) {
-                    Some(now) => now != &s.shadow[..],
+                && match memory.slice(addr + from as u32, to - from) {
+                    Some(now) => now != &s.shadow[from..to],
                     None => {
-                        let mut now = vec![0u8; size];
-                        memory.read(addr, &mut now);
-                        now != s.shadow
+                        let mut now = vec![0u8; to - from];
+                        memory.read(addr + from as u32, &mut now);
+                        now != s.shadow[from..to]
                     }
                 };
             if written {
@@ -6112,7 +6314,8 @@ impl Gles {
                 }
             }
             let row = s.row_bytes() as usize;
-            memory.write(addr + (first as usize * row) as u32, &bytes[first as usize * row..last as usize * row]);
+            let end = (last as usize * row).min(bytes.len() - s.tail_gap as usize);
+            memory.write(addr + (first as usize * row) as u32, &bytes[first as usize * row..end]);
             // memory holds what was just written, and around it what was there
             if (first, last) != (0, height) {
                 memory.read(addr, &mut bytes);
@@ -6459,6 +6662,7 @@ impl Gles {
                 Ok(Some(program)) => program,
                 // shaded on the CPU meanwhile
                 Ok(None) if vertex != 0 => return Err(COMPILING.to_owned()),
+                Ok(None) if draw.skippable => return Ok(()),
                 Ok(None) => {
                     exact = false;
                     self.program(&generic_constants(&constants), writes_depth, &[], 0, true, None)?.ok_or("no generic program")?
@@ -6493,6 +6697,10 @@ impl Gles {
             }
             (words, program)
         };
+        if self.stamped != Some((program, self.flushes)) {
+            self.stamped = Some((program, self.flushes));
+            self.program_used.insert(program, self.flushes);
+        }
 
         drop(worded);
         let color_mask = if r[REG_COLOR_BUFFER_WRITE] != 0 { (r[REG_DEPTH_COLOR_MASK] >> 8) & 0xF } else { 0 };
@@ -6896,10 +7104,13 @@ mod tests {
             let index = gles.surface_rows(&mut memory, addr, (w, h), Kind::Color(format), true, None).unwrap();
             gles.surfaces[index].drew((0, h));
         }
-        // and on past them into rows nothing drew, from memory
-        for (height, pieces) in [(96, 2), (128, 3)] {
+        // and on past them into rows nothing drew, from memory, a small
+        // drawing of another kind there written back first, as Smash's
+        let small = gles.surface_rows(&mut memory, top + 256 * 112 * 4, (64, 16), Kind::Color(ColorFormat::Rgb5A1), true, None).unwrap();
+        gles.surfaces[small].drew((0, 16));
+        for (height, pieces, apart) in [(96, 2, 0), (128, 3, 1)] {
             let texture = DrawnTexture { addr: top, width: 256, height, format };
-            assert_eq!(gles.retiled_sources(&texture).map(|pieces| pieces.len()), Some(pieces));
+            assert_eq!(gles.retiled_sources(&texture).map(|(pieces, apart)| (pieces.len(), apart.len())), Some((pieces, apart)));
             gles.copy_texture(&mut memory, &texture).unwrap();
             let mut expected = vec![0u8; (256 * height * 4) as usize];
             for y in 0..height {
@@ -6911,6 +7122,7 @@ mod tests {
             }
             assert_eq!(read_copy(&mut gles, &texture), expected, "256x{height} over two drawings");
         }
+        assert!(gles.surfaces[small].dirty.is_none(), "the small drawing was written back");
     }
 
     #[test]
@@ -6977,6 +7189,58 @@ mod tests {
         assert!(gles.surfaces.iter().any(|s| s.addr == drawing && s.dirty.is_some()));
         gles.flush(&mut memory).unwrap();
         assert_eq!(&memory.0[output as usize..output as usize + expected.len()], &expected[..], "drawing first {drawing_first}");
+    }
+
+    #[test]
+    fn a_transfer_out_of_a_linear_picture_stays_on_the_gpu() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        // a picture an earlier transfer left linear, transferred back into a
+        // tiled texture, as Paper Mario: Sticker Star does every frame
+        let format = ColorFormat::Rgba8;
+        let (input, output, width, height) = (0x1000u32, 0x10000u32, 32u32, 48u32);
+        let mut memory = Flat(vec![0; 0x20000]);
+        for (i, byte) in memory.0[input as usize..(input + width * height * 4) as usize].iter_mut().enumerate() {
+            *byte = (i * 37 + i / 5) as u8;
+        }
+        for flip in [false, true] {
+            let index = gles.surface_rows(&mut memory, input, (width, height), Kind::Color(format), false, None).unwrap();
+            gles.surfaces[index].drew((0, height));
+            let transfer = Transfer {
+                input,
+                output,
+                input_width: width,
+                input_height: height,
+                output_width: width,
+                output_height: height,
+                copy: (width, height),
+                scale: (1, 1),
+                flip,
+                input_linear: true,
+                output_tiled: true,
+                input_format: format,
+                output_format: format,
+                column: 0,
+            };
+            let mut expected = vec![0u8; (width * height * 4) as usize];
+            for y in 0..height {
+                for x in 0..width {
+                    let from = if flip { height - 1 - y } else { y };
+                    let at = (input + pixel_offset(false, x, from, width, 4) as u32) as usize;
+                    let to = pixel_offset(true, x, y, width, 4);
+                    expected[to..to + 4].copy_from_slice(&memory.0[at..at + 4]);
+                }
+            }
+            assert!(gles.display_transfer(&mut memory, &transfer).unwrap());
+            assert!(gles.surfaces.iter().any(|s| s.addr == input && !s.tiled && s.dirty.is_some()), "the picture stayed on the GPU");
+            gles.flush(&mut memory).unwrap();
+            assert_eq!(&memory.0[output as usize..output as usize + expected.len()], &expected[..], "flip {flip}");
+        }
     }
 
     #[test]
@@ -7049,6 +7313,62 @@ mod tests {
             // not starting on a tile is the CPU's
             assert!(!gles.texture_copy(&mut memory, source + 16, target, tile_rows, (0, 0), (0, 0)).unwrap());
         }
+    }
+
+    #[test]
+    fn a_copy_into_a_wider_texture_whose_padding_holds_the_drawing_stays_on_the_gpu() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        // Yo-kai Watch 2's top screen, 240x400, into a texture 256 wide that
+        // ends 512 bytes into it
+        let (width, height, padded) = (240u32, 400u32, 256u32);
+        let source = 0x80000u32;
+        let (line, skip) = (8 * width * 4, 8 * (padded - width) * 4);
+        let target = source - (height / 8 * (line + skip) - skip);
+        let size = width * height * 4;
+        let mut memory = Flat(vec![0; 0x100000]);
+        for (i, byte) in memory.0[source as usize..(source + size) as usize].iter_mut().enumerate() {
+            *byte = (i * 37 + i / 5) as u8;
+        }
+        let drawn = memory.0[source as usize..(source + size) as usize].to_vec();
+        let index = gles.surface_rows(&mut memory, source, (width, height), Kind::Color(ColorFormat::Rgba8), true, None).unwrap();
+        gles.surfaces[index].drew((0, height));
+        assert!(gles.texture_copy(&mut memory, source, target, size, (line, 0), (line, skip)).unwrap());
+        assert!(gles.surfaces[index].dirty.is_some(), "the drawing was not read back");
+        gles.flush(&mut memory).unwrap();
+        for row in 0..height / 8 {
+            let at = (target + row * (line + skip)) as usize;
+            assert_eq!(&memory.0[at..at + line as usize], &drawn[(row * line) as usize..((row + 1) * line) as usize], "row of tiles {row}");
+        }
+        assert_eq!(&memory.0[source as usize..(source + size) as usize], &drawn[..], "the drawing under the padding");
+    }
+
+    #[test]
+    fn a_texture_copy_running_past_a_drawing_takes_the_rest_from_memory() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let (source, target, width, height) = (0x1000u32, 0x8000u32, 32u32, 24u32);
+        let tile_rows = 8 * width * 4;
+        let mut memory = Flat(vec![0; 0x20000]);
+        for (i, byte) in memory.0[source as usize..(source + 4 * tile_rows) as usize].iter_mut().enumerate() {
+            *byte = (i * 37 + i / 5) as u8;
+        }
+        let index = gles.surface_rows(&mut memory, source, (width, height), Kind::Color(ColorFormat::Rgba8), true, None).unwrap();
+        gles.surfaces[index].drew((0, height));
+        // a row of tiles more than the drawing has, as Federation Force copies 64 rows out of 56
+        assert!(gles.texture_copy(&mut memory, source, target, 4 * tile_rows, (0, 0), (0, 0)).unwrap());
+        gles.flush(&mut memory).unwrap();
+        assert_eq!(&memory.0[target as usize..(target + 4 * tile_rows) as usize], &memory.0[source as usize..(source + 4 * tile_rows) as usize]);
     }
 
     #[test]

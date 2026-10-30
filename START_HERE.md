@@ -4,7 +4,7 @@ Pocket Native doesn't come with games, and it doesn't play your game
 files directly. Your PC rebuilds each of your 3DS games into a program
 made for your device first. Then:
 
-- on a **Linux handheld** (R36S and friends) you copy what the PC made
+- on a **Linux handheld** (R36S and similar) you copy what the PC made
   onto the SD card
 - on **Android** you install the app and add what the PC made to it
 
@@ -28,9 +28,9 @@ Before you start, check [which games work](docs/compatibility.md) and
   - Linux: podman or Docker.
   - Free space: a few GB for the build container, and two to three
     times each game's size for each game you build.
-- **Your own games**, dumped from your own console: a decrypted
-  `.3ds`/`.cci`, or a `.cia` along with your console's `aes_keys.txt`.
-  Any region works.
+- **Your own games**, dumped from your own console: a `.3ds`/`.cci` or
+  a `.cia`, also compressed as `.zcci`/`.zcia`. An encrypted one needs
+  your console's `aes_keys.txt` too. Any region works.
 
 ## 1. Get the kit
 
@@ -50,9 +50,9 @@ it and pick them.
 **Linux:** drag your games onto `Build a game`, or open it and pick
 them.
 
-Several games can go at once. A `.cia` needs your console's
-`aes_keys.txt`: put it next to the game or in the kit's folder and the
-build finds it, otherwise it asks.
+Several games can go at once. A `.cia` or an encrypted `.3ds` needs your
+console's `aes_keys.txt`: put it next to the game or in the kit's folder
+and the build finds it, otherwise it asks for a `.cia`.
 
 A window shows the build as it goes and stays open at the end so you
 can read how it went. The very first build sets up the build container,
@@ -189,6 +189,12 @@ Then:
 
 The menu shows which version you're running, at the top.
 
+A game that ran parts of itself slowly, interpreted, writes down where in
+`title.hints` beside it on the card. Copy the `Pocket Native` folder from
+the card back over the one in the kit's `build` folder, then open `Rebuild
+all games` (`Rebuild all games.bat` on Windows), and the build makes those
+parts run at full speed too. Copy the folder onto the card again after.
+
 ## If something goes wrong
 
 **Windows says it protected your PC, or asks whether to run the file.**
@@ -203,8 +209,9 @@ terminal.
 **The Windows build can't reach Docker.** Docker Desktop isn't running.
 Start it, wait until it says it's running, and build again.
 
-**The build says the game is encrypted.** Decrypt the dump first, or
-build it from the `.cia` with your `aes_keys.txt`.
+**The build says the game is encrypted.** Put your console's
+`aes_keys.txt` next to the game or in the kit's folder and build again,
+or decrypt the dump first (GodMode9: Decrypt file).
 
 **The update can't reach GitHub.** Check the PC's connection and try
 again, or get the new kit by hand as in step 1.

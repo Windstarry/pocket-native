@@ -100,10 +100,6 @@ left out. `help` is what the menu says about the option under the list, two
 lines at most (`cargo test` checks). The player's choices are saved per
 game.
 
-`bottom_relearn = true` at the top of a profile turns bottom screen
-skipping back on 300 pictures after it went off, for a game that sends a
-bottom sized picture to the top only at its start (Pokémon X and Y).
-
 ## Advanced settings in a profile
 
 When a game needs one of the engine's speed hacks off, its profile can say so
@@ -136,6 +132,7 @@ gpu_texture_copies = true # textures the game drew copied on the GPU, false
 in_place = true           # drawn textures sampled in place
 past_drawing = true       # a texture past a drawing repeats its edge
 etc1 = true               # compressed textures
+etc1a4 = true             # compressed textures with see-through parts, as two textures
 generic_shaders = false
 generic_lighting = false
 draw_ranges = true        # vertex ranges

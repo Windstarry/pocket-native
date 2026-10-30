@@ -208,12 +208,16 @@ static inline void (mem_write32)(Context *ctx, uint32_t address, uint32_t value)
 #undef mem_write8
 #undef mem_write16
 #undef mem_write32
-#define mem_read8(ctx, address) (*(const uint8_t *)((ctx)->fastmem + (uint32_t)(address)))
-#define mem_read16(ctx, address) ({ uint16_t __v; __builtin_memcpy(&__v, (ctx)->fastmem + (uint32_t)(address), 2); __v; })
-#define mem_read32(ctx, address) ({ uint32_t __v; __builtin_memcpy(&__v, (ctx)->fastmem + (uint32_t)(address), 4); __v; })
-#define mem_write8(ctx, address, value) do { *((ctx)->fastmem + (uint32_t)(address)) = (uint8_t)(value); } while (0)
-#define mem_write16(ctx, address, value) do { uint16_t __v = (value); __builtin_memcpy((ctx)->fastmem + (uint32_t)(address), &__v, 2); } while (0)
-#define mem_write32(ctx, address, value) do { uint32_t __v = (value); __builtin_memcpy((ctx)->fastmem + (uint32_t)(address), &__v, 4); } while (0)
+/* the view, which generated code holds in a local: a store through it
+   could be to the context as far as the compiler knows, which would have it
+   load ctx->fastmem again after every one */
+#define RECOMP_VIEW(ctx) ((ctx)->fastmem)
+#define mem_read8(ctx, address) (*(const uint8_t *)(RECOMP_VIEW(ctx) + (uint32_t)(address)))
+#define mem_read16(ctx, address) ({ uint16_t __v; __builtin_memcpy(&__v, RECOMP_VIEW(ctx) + (uint32_t)(address), 2); __v; })
+#define mem_read32(ctx, address) ({ uint32_t __v; __builtin_memcpy(&__v, RECOMP_VIEW(ctx) + (uint32_t)(address), 4); __v; })
+#define mem_write8(ctx, address, value) do { *(RECOMP_VIEW(ctx) + (uint32_t)(address)) = (uint8_t)(value); } while (0)
+#define mem_write16(ctx, address, value) do { uint16_t __v = (value); __builtin_memcpy(RECOMP_VIEW(ctx) + (uint32_t)(address), &__v, 2); } while (0)
+#define mem_write32(ctx, address, value) do { uint32_t __v = (value); __builtin_memcpy(RECOMP_VIEW(ctx) + (uint32_t)(address), &__v, 4); } while (0)
 #endif
 
 #define C_EQ (F_Z)

@@ -171,6 +171,11 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
             let ordered = sticks_in_order(ranges.map(|range| range.is_some()));
             log::info!("sticks from the axes it has, {ordered:?}");
             Some(ordered)
+        } else if rk3566 && ranges[3].is_some() && ranges[4].is_some() {
+            // right stick on ABS_RX and ABS_RY, as on the RK3562 handhelds,
+            // with ABS_Z and ABS_RZ left as the triggers
+            log::info!("RK3566 right stick on ABS_RX and ABS_RY");
+            Some([Some(0), Some(1), None, Some(3), Some(4), None])
         } else {
             sticks
         };

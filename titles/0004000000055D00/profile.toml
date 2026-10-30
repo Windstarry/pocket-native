@@ -1,8 +1,5 @@
 name = "Pokémon X"
 
-# its title screen sends one bottom sized picture to the top
-bottom_relearn = true
-
 # waiting for each GPU list held the game to ~23 fps, time going on
 # while the GPU draws keeps it at 30
 [advanced]

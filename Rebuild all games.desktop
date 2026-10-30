@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Rebuild all games
+Comment=Rebuild all games previously built by Pocket Native
+Icon=system-software-update
+Terminal=true
+Exec=sh -c "d=\\${0#file://}; exec \\"\\${d%%/*}/scripts/batch-rebuild.sh\\" --wait" %k
